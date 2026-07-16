@@ -1,0 +1,11 @@
+# Python virtualenv (recreate with install.sh / requirements.txt)
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime artifacts (live in $XDG_RUNTIME_DIR, but ignore if they ever appear here)
+*.log
+rec.wav
+ptt.wav
+daemon.sock

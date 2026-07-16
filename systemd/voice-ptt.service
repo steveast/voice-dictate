@@ -1,0 +1,21 @@
+[Unit]
+Description=Voice dictation push-to-talk (hold Right Ctrl)
+After=graphical-session.target ydotool.service
+Wants=ydotool.service
+
+[Service]
+Type=simple
+# Session plumbing (%t = XDG_RUNTIME_DIR, %h = home)
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
+# Dictation config (see README)
+Environment=VOICE_DICTATE_LANG=ru
+Environment=VD_PTT_KEY=KEY_RIGHTCTRL
+Environment=VD_PTT_MOD=
+ExecStart=%h/.local/share/voice-dictate/venv/bin/python %h/.local/share/voice-dictate/ptt_daemon.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
