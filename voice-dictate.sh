@@ -10,7 +10,7 @@
 # Bind this script to a global shortcut and press it to start/stop.
 set -euo pipefail
 
-BASE="$HOME/.local/share/voice-dictate"
+BASE="$(cd "$(dirname "$0")" && pwd)"
 VENV_PY="$BASE/venv/bin/python"
 DAEMON_PY="$BASE/transcribe_daemon.py"
 

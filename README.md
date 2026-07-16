@@ -56,9 +56,9 @@ global shortcut — kept as a fallback.
 ## 🚀 Install
 
 ```bash
-git clone https://github.com/steveast/voice-dictate ~/.local/share/voice-dictate
-cd ~/.local/share/voice-dictate
-./install.sh
+git clone https://github.com/steveast/voice-dictate
+cd voice-dictate
+./install.sh   # runs in place — clone wherever you like
 ```
 
 `install.sh` creates the venv, installs deps, and installs the systemd user

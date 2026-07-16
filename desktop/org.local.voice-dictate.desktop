@@ -1,5 +1,5 @@
 [Desktop Entry]
-Exec=/home/steve/.local/share/voice-dictate/voice-dictate.sh
+Exec=/home/steve/Dev/voice-dictate/voice-dictate.sh
 Name=Voice Dictate (toggle)
 NoDisplay=true
 StartupNotify=false

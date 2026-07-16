@@ -1,35 +1,29 @@
 #!/usr/bin/env bash
-# Installer for voice-dictate. Run it from the cloned repo directory.
-# It sets up the Python venv and the systemd user service, then prints the
-# one-time privileged steps it can't perform itself.
+# Installer for voice-dictate. Run it from wherever you cloned the repo — the
+# app runs in place, and the systemd unit is generated to point here. Sets up
+# the Python venv and the service, then prints the one-time privileged steps.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TARGET="$HOME/.local/share/voice-dictate"
 
 echo "==> voice-dictate installer"
-echo "    repo:   $REPO"
-echo "    target: $TARGET"
+echo "    location: $REPO"
 
-if [ "$REPO" != "$TARGET" ]; then
-  echo "!!  The systemd unit expects the code at $TARGET."
-  echo "    Clone/move it there, or edit systemd/voice-ptt.service accordingly."
-fi
-
-# 1) Python venv + dependencies
-if [ ! -x "$TARGET/venv/bin/python" ]; then
-  echo "==> creating venv at $TARGET/venv"
-  python3 -m venv "$TARGET/venv"
+# 1) Python venv + dependencies (in place)
+if [ ! -x "$REPO/venv/bin/python" ]; then
+  echo "==> creating venv at $REPO/venv"
+  python3 -m venv "$REPO/venv"
 fi
 echo "==> installing Python dependencies"
-"$TARGET/venv/bin/pip" install --upgrade pip >/dev/null
-"$TARGET/venv/bin/pip" install -r "$REPO/requirements.txt"
+"$REPO/venv/bin/pip" install --upgrade pip >/dev/null
+"$REPO/venv/bin/pip" install -r "$REPO/requirements.txt"
 
-# 2) systemd user service
+# 2) systemd user service, wired to this location
 echo "==> installing systemd user unit"
 mkdir -p "$HOME/.config/systemd/user"
-install -m 644 "$REPO/systemd/voice-ptt.service" \
-        "$HOME/.config/systemd/user/voice-ptt.service"
+sed "s#^ExecStart=.*#ExecStart=$REPO/venv/bin/python $REPO/ptt_daemon.py#" \
+    "$REPO/systemd/voice-ptt.service" \
+    > "$HOME/.config/systemd/user/voice-ptt.service"
 systemctl --user daemon-reload
 
 cat <<'EOF'
