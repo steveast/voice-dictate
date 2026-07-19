@@ -38,6 +38,34 @@ Config via env:
                         phrases don't glue together; \n / \t honoured
                         (default: one space; set empty to disable)
 
+A second "polish" chord rewrites the dictation through a Claude model (fixes
+grammar/structure, adds a little emoji) before pasting; the normal chord stays
+verbatim. It reuses the Claude Code CLI's OAuth token (VD_POLISH_CREDS), so no
+separate API key is needed; if the token is stale the raw text is pasted and a
+hint is shown. Config via env:
+  VD_POLISH_KEY         dedicated key(s) for the polish hold — its own push-to-
+                        talk key, independent of VD_PTT_KEY (avoids the press-
+                        order races of a shared-key chord). Accepts several keys,
+                        comma/space separated; holding ANY of them starts polish
+                        (handy when two keyboards expose different keys). Empty =
+                        ride on VD_PTT_KEY + VD_POLISH_MOD instead.
+                        (default: empty)
+  VD_POLISH_MOD         extra modifier groups required for polish, on top of the
+                        polish key: space-separated groups, comma-separated
+                        alternatives within a group; every group must have a key
+                        held. Polish is off only if VD_POLISH_KEY and this are
+                        both empty.
+                        (default: KEY_LEFTCTRL,KEY_RIGHTCTRL KEY_LEFTSHIFT,KEY_RIGHTSHIFT)
+  VD_POLISH_MODEL       Claude model id            (default: claude-haiku-4-5)
+  VD_POLISH_PROMPT      system prompt for the rewrite (has a sensible default)
+  VD_POLISH_MAX_TOKENS  response cap               (default: 1024)
+  VD_POLISH_TIMEOUT     seconds to wait on the API (default: 20)
+  VD_POLISH_CREDS       Claude CLI credentials json
+                        (default: ~/.claude/.credentials.json)
+  VD_POLISH_START_WAV   distinct start beep for the polish chord, so you can
+                        hear which mode you're in (default: polish_start.wav;
+                        falls back to start.wav if missing)
+
 The dictated text is left sitting in the clipboard after pasting (not restored),
 so if the auto-paste misses — e.g. focus moved away from the field — you can just
 Ctrl+V it in yourself.
@@ -46,9 +74,12 @@ import os
 import sys
 import time
 import wave
+import json
 import signal
 import selectors
 import subprocess
+import urllib.request
+import urllib.error
 
 import numpy as np
 import evdev
@@ -78,8 +109,31 @@ BEAM = int(os.environ.get("VD_BEAM", "5"))
 # Backslash escapes (\n, \t) are honoured; default is a single space.
 TRAILING = os.environ.get("VD_TRAILING", " ").replace("\\n", "\n").replace("\\t", "\t")
 
+# --- Polish mode: a second chord that rewrites the dictation through a Claude
+# model before pasting (the normal chord stays verbatim). Off if POLISH_MOD is
+# empty. Reuses the Claude Code CLI's OAuth token so no separate key is needed.
+POLISH_KEY = os.environ.get("VD_POLISH_KEY", "").strip()
+POLISH_MOD = os.environ.get(
+    "VD_POLISH_MOD", "KEY_LEFTCTRL,KEY_RIGHTCTRL KEY_LEFTSHIFT,KEY_RIGHTSHIFT")
+POLISH_MODEL = os.environ.get("VD_POLISH_MODEL", "claude-haiku-4-5")
+POLISH_MAX_TOKENS = int(os.environ.get("VD_POLISH_MAX_TOKENS", "1024"))
+POLISH_TIMEOUT = float(os.environ.get("VD_POLISH_TIMEOUT", "20"))
+POLISH_CREDS = os.path.expanduser(
+    os.environ.get("VD_POLISH_CREDS", "~/.claude/.credentials.json"))
+POLISH_PROMPT = os.environ.get("VD_POLISH_PROMPT", (
+    "Ты — редактор устной речи. Тебе дают фрагмент, надиктованный голосом: он "
+    "сумбурный, часто без пунктуации, мысли скомканы. Перепиши его грамотно, "
+    "связно и красиво: исправь грамматику и пунктуацию, выстрой предложения, "
+    "сохрани смысл, факты и тон говорящего. Добавь немного уместных эмодзи, не "
+    "переусердствуй. Верни ТОЛЬКО переписанный текст — без кавычек, без "
+    "пояснений, без преамбулы вроде «вот переписанный вариант»."))
+
 START_WAV = os.path.join(BASE, "start.wav")
 STOP_WAV = os.path.join(BASE, "stop.wav")
+# Distinct start cue for polish mode, so you can hear which mode you're in.
+# Falls back to START_WAV if this file is missing.
+POLISH_START_WAV = (os.environ.get("VD_POLISH_START_WAV")
+                    or os.path.join(BASE, "polish_start.wav"))
 
 
 def log(*a):
@@ -161,20 +215,68 @@ def pretty_combo(mod_codes, main_code):
     return "+".join(parts)
 
 
+def polish_text(text):
+    """Rewrite dictated text through a Claude model, reusing the Claude Code
+    CLI's stored OAuth token. Returns (polished, err): `polished` is the cleaned
+    string, or None on any failure — in which case `err` is a short reason for
+    the notification and the caller should fall back to the raw text."""
+    try:
+        with open(POLISH_CREDS) as f:
+            token = json.load(f).get("claudeAiOauth", {}).get("accessToken")
+        if not token:
+            return None, "нет токена Claude"
+    except (OSError, ValueError) as e:
+        log("polish: creds unreadable:", repr(e))
+        return None, "нет доступа к токену"
+
+    body = json.dumps({
+        "model": POLISH_MODEL,
+        "max_tokens": POLISH_MAX_TOKENS,
+        "system": POLISH_PROMPT,
+        "messages": [{"role": "user",
+                      "content": "Вот надиктованный фрагмент, перепиши его:\n\n" + text}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"authorization": "Bearer " + token,
+                 "anthropic-version": "2023-06-01",
+                 "anthropic-beta": "oauth-2025-04-20",
+                 "content-type": "application/json"})
+    try:
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=POLISH_TIMEOUT) as r:
+            data = json.load(r)
+        out = "".join(b.get("text", "") for b in data.get("content", [])
+                      if b.get("type") == "text").strip()
+        log(f"polish {len(text)}->{len(out)} chars in {time.time() - t0:.1f}s")
+        return (out, None) if out else (None, "пустой ответ")
+    except urllib.error.HTTPError as e:
+        log("polish HTTP", e.code)
+        # 401/403: the OAuth token is stale — Claude Code refreshes it on use.
+        if e.code in (401, 403):
+            return None, "токен протух — запусти claude разок"
+        return None, f"API {e.code}"
+    except Exception as e:  # noqa: BLE001
+        log("polish error:", repr(e))
+        return None, "сеть/таймаут"
+
+
 class Dictation:
     def __init__(self, model, recorder):
         self.model = model
         self.recorder = recorder
         self.proc = None
         self.t0 = 0.0
+        self.mode = "verbatim"          # or "polish"; set per press in start()
 
     @property
     def active(self):
         return self.proc is not None
 
-    def start(self):
+    def start(self, mode="verbatim"):
         if self.proc is not None:
             return
+        self.mode = mode
         os.makedirs(RUNDIR, exist_ok=True)
         try:
             os.unlink(WAV)
@@ -184,9 +286,11 @@ class Dictation:
         self.proc = subprocess.Popen(self.recorder + [WAV],
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
-        beep(START_WAV)
-        notify("🎙️ Запись… (держи клавишу)", 10000)
-        log("recording started")
+        beep(POLISH_START_WAV if mode == "polish" and os.path.exists(POLISH_START_WAV)
+             else START_WAV)
+        notify("✨🎙️ Запись… (причешу)" if mode == "polish"
+               else "🎙️ Запись… (держи клавишу)", 10000)
+        log(f"recording started (mode={mode})")
 
     def stop_and_transcribe(self):
         """Stop the recorder and return the recognized text (or "")."""
@@ -264,8 +368,9 @@ def enumerate_event_paths():
     return paths
 
 
-def open_keyboards(main_code):
-    """Return InputDevice objects for every keyboard exposing the main key."""
+def open_keyboards(key_codes):
+    """Return InputDevice objects for every keyboard exposing any trigger key
+    (the verbatim key or the polish key — they can live on different devices)."""
     devs = []
     for path in enumerate_event_paths():
         try:
@@ -273,7 +378,7 @@ def open_keyboards(main_code):
         except OSError:
             continue
         caps = d.capabilities().get(ecodes.EV_KEY, [])
-        if main_code in caps:
+        if any(k in caps for k in key_codes):
             devs.append(d)
             log(f"listening on {d.path} ({d.name})")
     return devs
@@ -288,14 +393,31 @@ def main():
     require_mod = bool(mod_codes)
     combo = pretty_combo(sorted(mod_codes), main_code)
 
+    # Polish trigger: an optional dedicated key (VD_POLISH_KEY) plus optional
+    # modifier groups (VD_POLISH_MOD). With a dedicated key it's a plain hold,
+    # independent of the verbatim key — no chord ordering to get wrong. Each
+    # space-separated group needs one of its (comma-separated) alternatives held.
+    polish_mains = {getattr(ecodes, k) for k in POLISH_KEY.replace(",", " ").split()
+                    if hasattr(ecodes, k)} or {main_code}
+    polish_groups = []
+    for grp in POLISH_MOD.split():
+        codes = {getattr(ecodes, m) for m in grp.split(",") if hasattr(ecodes, m)}
+        if codes:
+            polish_groups.append(codes)
+    polish_enabled = bool(POLISH_KEY) or bool(polish_groups)
+    polish_combo = ("/".join(pretty_combo([min(g) for g in polish_groups], m)
+                             for m in sorted(polish_mains)) if polish_enabled else "")
+
     recorder = find_recorder()
     if recorder is None:
         log("no recorder (pw-record/parecord/arecord) found")
         sys.exit(1)
 
-    devs = open_keyboards(main_code)
+    devs = open_keyboards({main_code} | polish_mains)
     if not devs:
-        log(f"no keyboard exposes {PTT_KEY}; check /dev/input permissions")
+        log(f"no keyboard exposes {PTT_KEY}"
+            + (f"/{POLISH_KEY}" if POLISH_KEY else "")
+            + "; check /dev/input permissions")
         sys.exit(1)
 
     from faster_whisper import WhisperModel
@@ -303,32 +425,35 @@ def main():
     t0 = time.time()
     model = WhisperModel(MODEL, device="cpu", compute_type=COMPUTE,
                          cpu_threads=THREADS)
-    log(f"model ready in {time.time() - t0:.1f}s; hold {combo} to dictate")
-    notify(f"🚀 Готово — держи {combo} для диктовки", 4000)
+    log(f"model ready in {time.time() - t0:.1f}s; hold {combo} to dictate"
+        + (f", {polish_combo} to polish" if polish_enabled else ""))
+    notify(f"🚀 Готово: {combo} — диктовка" +
+           (f", {polish_combo} — причесать ✨" if polish_enabled else ""), 4000)
 
     dictation = Dictation(model, recorder)
     sel = selectors.DefaultSelector()
     for d in devs:
         sel.register(d, selectors.EVENT_READ)
 
-    def keys_now():
+    def triggers_now():
         """Ground-truth key state straight from the kernel (EVIOCGKEY). Immune
-        to a missed press/release event, so the chord can never desync."""
-        main_now = mod_now = False
+        to a missed press/release event, so the chord can never desync.
+        Returns (verbatim held, polish held)."""
+        active = set()
         for d in devs:
             try:
-                ak = d.active_keys()
+                active.update(d.active_keys())
             except OSError:
                 continue
-            if main_code in ak:
-                main_now = True
-            if mod_codes.intersection(ak):
-                mod_now = True
-        return main_now, mod_now
+        verb_held = (main_code in active
+                     and (bool(mod_codes & active) or not require_mod))
+        polish_held = (polish_enabled and bool(polish_mains & active)
+                       and all(g & active for g in polish_groups))
+        return verb_held, polish_held
 
     def drain_ready(timeout):
         """Consume queued events so select() doesn't spin. The details don't
-        matter — the real chord state is read from keys_now(), not from here."""
+        matter — the real chord state is read from triggers_now(), not here."""
         for key, _ in sel.select(timeout):
             try:
                 for _ in key.fileobj.read():
@@ -340,16 +465,27 @@ def main():
                     pass
 
     def wait_mod_release(timeout=1.5):
-        """Before pasting, wait for the modifier to be physically released, else
-        the injected Ctrl+V would combine with a held Alt into Ctrl+Alt+V."""
-        if not require_mod:
-            return
+        """Before pasting, wait for the trigger keys to be physically released,
+        else the injected Ctrl+V combines with a still-held key/modifier
+        (Ctrl+Alt+V, Ctrl+Shift+V) and doesn't paste."""
         end = time.time() + timeout
-        while time.time() < end and keys_now()[1]:
+        while time.time() < end:
+            verb_held, polish_held = triggers_now()
+            if not (verb_held or polish_held):
+                break
             drain_ready(0.05)
 
     def finish():
+        mode = dictation.mode
         text = dictation.stop_and_transcribe()
+        # Polish first: the ~2s API call overlaps the user releasing the chord.
+        if text and mode == "polish":
+            notify("✨ Причёсываю…", 8000)
+            polished, err = polish_text(text)
+            if polished:
+                text = polished
+            else:
+                notify("⚠️ Без причёсывания: " + (err or "ошибка"), 3000)
         wait_mod_release()
         if text:
             dictation.paste(text)
@@ -360,13 +496,21 @@ def main():
     armed = True
     while True:
         drain_ready(0.5 if dictation.active else None)
-        main_now, mod_now = keys_now()
-        chord_held = main_now and (mod_now or not require_mod)
+        verb_held, polish_held = triggers_now()
+        # Polish wins when its trigger is held (the verbatim and polish keys are
+        # distinct, so normally only one is held at a time).
+        if polish_held:
+            want = "polish"
+        elif verb_held:
+            want = "verbatim"
+        else:
+            want = None
+        chord_held = want is not None
 
         if not chord_held:
             armed = True                      # a fresh press is required to start
         if chord_held and armed and not dictation.active:
-            dictation.start()
+            dictation.start(want)
             armed = False
         elif dictation.active and not chord_held:
             finish()
