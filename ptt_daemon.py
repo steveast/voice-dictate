@@ -30,8 +30,10 @@ Config via env:
                          (default: Ctrl+V "29:1 47:1 47:0 29:0";
                           terminals: Ctrl+Shift+V "29:1 42:1 47:1 47:0 42:0 29:0")
   VD_MIN_MS             ignore presses shorter than this   (default: 250)
-  VD_KEEP_CLIPBOARD     1 = leave dictated text in the clipboard; default 0 =
-                        restore the clipboard the user had before pasting
+
+The dictated text is left sitting in the clipboard after pasting (not restored),
+so if the auto-paste misses — e.g. focus moved away from the field — you can just
+Ctrl+V it in yourself.
 """
 import os
 import sys
@@ -61,9 +63,6 @@ MIN_MS = int(os.environ.get("VD_MIN_MS", "250"))
 # Safety cap: force-stop a recording that somehow never received a key release,
 # so a stuck "recording" notification can never hang indefinitely.
 MAX_REC = float(os.environ.get("VD_MAX_SEC", "180"))
-# Restore the previous clipboard after pasting (default). Set to 1 to instead
-# leave the dictated text sitting in the clipboard.
-KEEP_CLIPBOARD = os.environ.get("VD_KEEP_CLIPBOARD", "0") == "1"
 
 START_WAV = os.path.join(BASE, "start.wav")
 STOP_WAV = os.path.join(BASE, "stop.wav")
@@ -220,18 +219,11 @@ class Dictation:
                        os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
                                     ".ydotool_socket"))
 
-        # Save the user's current clipboard so dictation doesn't clobber it.
-        # (KWin exposes no virtual-keyboard / input-method-v2 protocol, so a
-        # real clipboard-free Unicode type is not possible here; the next best
-        # thing is to paste and then put the old clipboard back.)
-        old = None
-        if not KEEP_CLIPBOARD:
-            try:
-                r = subprocess.run(["wl-paste", "-n"], capture_output=True, timeout=1)
-                old = r.stdout if r.returncode == 0 else b""
-            except (OSError, subprocess.TimeoutExpired):
-                old = b""
-
+        # Put the dictated text on the clipboard and leave it there. The auto
+        # Ctrl+V below is best-effort — if focus has moved off the target field
+        # the paste misses, but the text stays in the clipboard so it can be
+        # pasted by hand. (KWin exposes no virtual-keyboard / input-method-v2
+        # protocol, so a real clipboard-free Unicode type is not possible here.)
         try:
             subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
         except OSError:
@@ -243,16 +235,6 @@ class Dictation:
         except OSError:
             log("ydotool missing")
             return
-
-        if not KEEP_CLIPBOARD:
-            time.sleep(0.4)  # let the target consume the paste before restoring
-            try:
-                if old:
-                    subprocess.run(["wl-copy"], input=old, check=False)
-                else:
-                    subprocess.run(["wl-copy", "--clear"], check=False)
-            except OSError:
-                pass
 
 
 def enumerate_event_paths():
@@ -354,7 +336,7 @@ def main():
         wait_mod_release()
         if text:
             dictation.paste(text)
-            notify("✅ " + text, 4000)
+            notify("📋 " + text, 4000)
 
     # Event-driven when idle; while recording, wake every 0.5s to re-check the
     # real key state (self-heals a missed release) and enforce the safety cap.

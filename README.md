@@ -16,8 +16,8 @@ Cyrillic. This project takes a different route (see [How it works](#-how-it-work
   service), so transcription starts instantly (~3–4 s for a phrase on CPU).
 - **Global hotkey on Wayland**: the key is read straight from the kernel via
   `evdev`, so it works regardless of the compositor and in any app.
-- **Non-clobbering paste**: your clipboard is saved before pasting and restored
-  after.
+- **Clipboard-backed paste**: the dictated text is left in the clipboard, so if
+  the auto-paste misses (focus moved off the field) you can just Ctrl+V it.
 - **Clear feedback**: soft start/stop beeps + a single, self-replacing desktop
   notification.
 
@@ -26,7 +26,7 @@ Cyrillic. This project takes a different route (see [How it works](#-how-it-work
 ```
 hold key ──▶ pw-record (16 kHz mono WAV)
 release  ──▶ faster-whisper (Russian, VAD) ──▶ text
-         ──▶ wl-copy + ydotool Ctrl+V ──▶ focused window (clipboard restored)
+         ──▶ wl-copy + ydotool Ctrl+V ──▶ focused window (text kept in clipboard)
 ```
 
 - The key is captured with **evdev** (raw kernel input) and its real state is
@@ -34,7 +34,8 @@ release  ──▶ faster-whisper (Russian, VAD) ──▶ text
   leave recording stuck.
 - Text is inserted via **clipboard + `ydotool` Ctrl+V**. A real clipboard-free
   Unicode "type" isn't possible on KWin (no `virtual_keyboard_manager_v1`, no
-  `input-method-v2`), so the clipboard is saved and restored around the paste.
+  `input-method-v2`), so the text is left in the clipboard as a fallback: if the
+  auto-paste lands in the wrong place, just Ctrl+V it yourself.
 - Pick a **non-printing** PTT key (a modifier or a spare key). Keys are not
   grabbed, so a letter key would leak into the focused app — `Right Ctrl` is the
   sensible default (like Discord PTT).
@@ -107,7 +108,6 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VOICE_DICTATE_COMPUTE` | `int8` | ctranslate2 compute type |
 | `VOICE_DICTATE_THREADS` | all cores | CPU threads |
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
-| `VD_KEEP_CLIPBOARD` | `0` | `1` = leave dictated text in the clipboard instead of restoring |
 | `VD_MIN_MS` | `250` | ignore presses shorter than this |
 | `VD_MAX_SEC` | `180` | safety cap on a single recording |
 
