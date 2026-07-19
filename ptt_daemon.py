@@ -38,9 +38,22 @@ Config via env:
                         phrases don't glue together; \n / \t honoured
                         (default: one space; set empty to disable)
 
+Mic conditioning (needs ffmpeg; cleans/levels the recording in-process before
+transcription — the system default mic is left raw, so calls/other apps are
+untouched):
+  VD_CLEAN              1/0 master switch. Off (or no ffmpeg) = the old plain
+                        16 kHz/mono capture, no post-processing   (default: 1)
+  VD_REC_RATE           capture sample rate for the conditioned path; this card
+                        exposes a cleaner 48 kHz altset            (default: 48000)
+  VD_REC_CH             capture channels for the conditioned path  (default: 2)
+  VD_CLEAN_FILTER       ffmpeg -af chain: high-pass + gentle FFT denoise + speech
+                        leveling (louder/clearer) + limiter. Empty = resample
+                        only. Swap afftdn for arnndn=m=<model.rnnn> for RNNoise
+                        AI denoise.                     (default: a tuned chain)
+
 A second "polish" chord rewrites the dictation through a Claude model (fixes
-grammar/structure, adds a little emoji) before pasting; the normal chord stays
-verbatim. It reuses the Claude Code CLI's OAuth token (VD_POLISH_CREDS), so no
+grammar/structure, an occasional emoji at most) before pasting; the normal chord
+stays verbatim. It reuses the Claude Code CLI's OAuth token (VD_POLISH_CREDS), so no
 separate API key is needed; if the token is stale the raw text is pasted and a
 hint is shown. Config via env:
   VD_POLISH_KEY         dedicated key(s) for the polish hold — its own push-to-
@@ -88,6 +101,9 @@ from evdev import ecodes
 BASE = os.path.dirname(os.path.abspath(__file__))
 RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voice-dictate")
 WAV = os.path.join(RUNDIR, "ptt.wav")
+# The conditioned (denoised/leveled/16 kHz-mono) copy ffmpeg writes; whisper
+# reads this instead of WAV when conditioning is on and succeeds.
+CLEAN_WAV = os.path.join(RUNDIR, "ptt.clean.wav")
 
 MODEL = os.environ.get("VOICE_DICTATE_MODEL",
                        "mobiuslabsgmbh/faster-whisper-large-v3-turbo")
@@ -109,6 +125,32 @@ BEAM = int(os.environ.get("VD_BEAM", "5"))
 # Backslash escapes (\n, \t) are honoured; default is a single space.
 TRAILING = os.environ.get("VD_TRAILING", " ").replace("\\n", "\n").replace("\\t", "\t")
 
+# --- Mic conditioning: capture a better source and clean it up with ffmpeg
+# before transcription. This runs entirely in-process on the recorded buffer,
+# so the *system* default mic stays raw — calls and other apps are untouched
+# (the lesson from the earlier attempt to route dictation through a cleaned
+# default source: EasyEffects' VAD gate ate word starts and wrecked accuracy).
+# No new Python dependency: ffmpeg does the DSP. VD_CLEAN=0 falls back to the
+# plain 16 kHz/mono capture with no post-processing (exactly the old behaviour),
+# as does a missing ffmpeg.
+CLEAN = os.environ.get("VD_CLEAN", "1").strip().lower() not in ("0", "false", "no", "")
+# Capture format for the conditioned path. This cheap USB card exposes a
+# 48 kHz stereo altset next to the 16 kHz mono one; grabbing 48 kHz and letting
+# ffmpeg resample down to whisper's 16 kHz is cleaner than recording native
+# 16 kHz on this hardware. Ignored when conditioning is off.
+REC_RATE = os.environ.get("VD_REC_RATE", "48000")
+REC_CH = os.environ.get("VD_REC_CH", "2")
+# ffmpeg -af chain applied to the recording, tuned gentle so it helps whisper
+# rather than hurting it: kill sub-90 Hz rumble/handling noise, mild FFT
+# denoise, raise the level (the "louder & clearer" win), and a limiter so
+# nothing clips. Set VD_CLEAN_FILTER="" to only resample (no filtering).
+# Override to taste — e.g. swap afftdn for RNNoise AI denoise with
+# arnndn=m=/path/to/model.rnnn once you have a .rnnn model file.
+CLEAN_FILTER = os.environ.get(
+    "VD_CLEAN_FILTER",
+    "highpass=f=90,afftdn=nr=12:nf=-25,speechnorm=p=0.95:e=6.25,"
+    "alimiter=limit=0.97:level=disabled")
+
 # --- Polish mode: a second chord that rewrites the dictation through a Claude
 # model before pasting (the normal chord stays verbatim). Off if POLISH_MOD is
 # empty. Reuses the Claude Code CLI's OAuth token so no separate key is needed.
@@ -124,8 +166,9 @@ POLISH_PROMPT = os.environ.get("VD_POLISH_PROMPT", (
     "Ты — редактор устной речи. Тебе дают фрагмент, надиктованный голосом: он "
     "сумбурный, часто без пунктуации, мысли скомканы. Перепиши его грамотно, "
     "связно и красиво: исправь грамматику и пунктуацию, выстрой предложения, "
-    "сохрани смысл, факты и тон говорящего. Добавь немного уместных эмодзи, не "
-    "переусердствуй. Верни ТОЛЬКО переписанный текст — без кавычек, без "
+    "сохрани смысл, факты и тон говорящего. Эмодзи почти не используй: чаще "
+    "всего не добавляй ни одного, максимум один на весь фрагмент и только если "
+    "он явно к месту. Верни ТОЛЬКО переписанный текст — без кавычек, без "
     "пояснений, без преамбулы вроде «вот переписанный вариант»."))
 
 START_WAV = os.path.join(BASE, "start.wav")
@@ -185,15 +228,44 @@ def load_wav(path):
     return a
 
 
-def find_recorder():
-    for cmd in (["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16"],
-                ["parecord", "--rate=16000", "--channels=1", "--format=s16le",
-                 "--file-format=wav"],
-                ["arecord", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "wav"]):
-        if any(os.access(os.path.join(p, cmd[0]), os.X_OK)
-               for p in os.environ.get("PATH", "").split(":")):
+def on_path(name):
+    return any(os.access(os.path.join(p, name), os.X_OK)
+               for p in os.environ.get("PATH", "").split(":"))
+
+
+def find_recorder(rate="16000", channels="1"):
+    for cmd in (["pw-record", "--rate", rate, "--channels", channels, "--format", "s16"],
+                ["parecord", f"--rate={rate}", f"--channels={channels}",
+                 "--format=s16le", "--file-format=wav"],
+                ["arecord", "-f", "S16_LE", "-r", rate, "-c", channels, "-t", "wav"]):
+        if on_path(cmd[0]):
             return cmd
     return None
+
+
+def condition_wav(src, dst):
+    """Clean the recorded WAV with ffmpeg (CLEAN_FILTER) and resample it to the
+    16 kHz mono PCM whisper wants. Returns True when `dst` was written; False on
+    any failure, so the caller can fall back to the raw recording and never lose
+    a dictation."""
+    af = CLEAN_FILTER.strip()
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src]
+    if af:
+        cmd += ["-af", af]
+    cmd += ["-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", dst]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log("condition: ffmpeg failed:", repr(e))
+        return False
+    if r.returncode != 0:
+        log("condition: ffmpeg rc", r.returncode,
+            r.stderr.decode("utf-8", "replace").strip()[:200])
+        return False
+    if not os.path.exists(dst) or os.path.getsize(dst) < 1000:
+        log("condition: empty output")
+        return False
+    return True
 
 
 def pretty_combo(mod_codes, main_code):
@@ -314,8 +386,13 @@ class Dictation:
             return ""
 
         notify("✍️ Расшифровка…", 3000)
+        # Clean & level the recording (denoise, boost, resample) before whisper
+        # sees it. Best-effort: on any ffmpeg failure we transcribe the raw WAV.
+        src = WAV
+        if CLEAN and on_path("ffmpeg") and condition_wav(WAV, CLEAN_WAV):
+            src = CLEAN_WAV
         try:
-            audio = load_wav(WAV)
+            audio = load_wav(src)
             lang = None if LANG == "auto" else LANG
             t1 = time.time()
             segments, _ = self.model.transcribe(audio, language=lang,
@@ -408,10 +485,17 @@ def main():
     polish_combo = ("/".join(pretty_combo([min(g) for g in polish_groups], m)
                              for m in sorted(polish_mains)) if polish_enabled else "")
 
-    recorder = find_recorder()
+    # With conditioning on, capture the richer 48 kHz/stereo altset and let
+    # ffmpeg resample; otherwise record straight to whisper's 16 kHz/mono.
+    clean_on = CLEAN and on_path("ffmpeg")
+    recorder = (find_recorder(REC_RATE, REC_CH) if clean_on else find_recorder())
     if recorder is None:
         log("no recorder (pw-record/parecord/arecord) found")
         sys.exit(1)
+    log("mic conditioning: "
+        + (f"on ({REC_RATE} Hz/{REC_CH}ch -> ffmpeg -> 16k mono)" if clean_on
+           else "off (raw 16k mono)"
+                + ("; VD_CLEAN=0" if not CLEAN else "; ffmpeg not found")))
 
     devs = open_keyboards({main_code} | polish_mains)
     if not devs:

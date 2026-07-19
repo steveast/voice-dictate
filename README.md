@@ -21,14 +21,20 @@ Cyrillic. This project takes a different route (see [How it works](#-how-it-work
 - **Clear feedback**: soft start/stop beeps + a single, self-replacing desktop
   notification.
 - **Optional "polish" mode**: a second push-to-talk key rewrites the dictation
-  through a Claude model (fixes grammar/structure, adds a little emoji) before
-  pasting, with its own start chime — the normal key stays verbatim.
+  through a Claude model (fixes grammar/structure, an occasional emoji at most)
+  before pasting, with its own start chime — the normal key stays verbatim.
+- **Mic conditioning** (on by default, needs `ffmpeg`): the recording is
+  captured from the card's cleaner 48 kHz altset and run through a gentle
+  ffmpeg chain — high-pass, mild denoise, speech leveling (louder & clearer),
+  limiter — before transcription. It touches only the dictation buffer, never
+  the system mic, so calls and other apps are unaffected.
 
 ## ⚙️ How it works
 
 ```
-hold key ──▶ pw-record (16 kHz mono WAV)
-release  ──▶ faster-whisper (Russian, VAD) ──▶ text
+hold key ──▶ pw-record (48 kHz stereo WAV)
+release  ──▶ ffmpeg (high-pass · denoise · level · limiter → 16 kHz mono)
+         ──▶ faster-whisper (Russian, VAD) ──▶ text
          ──▶ wl-copy + ydotool Ctrl+V ──▶ focused window (text kept in clipboard)
 ```
 
@@ -50,8 +56,8 @@ global shortcut — kept as a fallback.
 ## ✨ Polish mode (optional)
 
 A second push-to-talk key rewrites the dictation before pasting — fixes grammar
-and punctuation, tidies rambling phrasing, and adds a little emoji — while the
-normal key still pastes the raw transcription. Great for chat and notes; keep
+and punctuation, tidies rambling phrasing, and adds an occasional emoji at most —
+while the normal key still pastes the raw transcription. Great for chat and notes; keep
 the verbatim key for terminals, code, and search boxes.
 
 ```
@@ -73,11 +79,37 @@ hold polish key ──▶ pw-record ──▶ faster-whisper ──▶ Claude (r
 > emit a modifier combo. If that gets in the way, remap the physical key to an
 > inert one (e.g. `F24`) with a udev `hwdb` rule and point `VD_POLISH_KEY` at it.
 
+## 🎚️ Mic conditioning (optional, on by default)
+
+Cheap USB mics are quiet and noisy. But route dictation through the *system*
+default source (an EasyEffects/RNNoise chain) and you'll fight its VAD gate,
+which clips word starts and tanks accuracy. So the cleanup is done **in-process
+on the recorded buffer** instead — the system mic stays raw and calls/other apps
+are untouched.
+
+On key release the recording is passed through one `ffmpeg` filter chain:
+
+```
+highpass=f=90        → cut sub-90 Hz rumble & handling noise
+afftdn=nr=12:nf=-25  → gentle FFT denoise (≈no-op in a quiet room, helps when noisy)
+speechnorm=…         → raise the level (the "louder & clearer" win), capped so
+                       silence/pauses are NOT amplified into loud hiss
+alimiter=…           → catch peaks so nothing clips
+                     → resampled to whisper's 16 kHz mono
+```
+
+It's all best-effort: if `ffmpeg` is missing, the chain errors, or you set
+`VD_CLEAN=0`, dictation falls back to the plain raw 16 kHz capture — nothing is
+ever lost. Tune or replace the chain with `VD_CLEAN_FILTER` (e.g. swap `afftdn`
+for `arnndn=m=/path/to/model.rnnn` to use the RNNoise **AI** denoiser once you
+have a `.rnnn` model).
+
 ## 📦 Requirements
 
 - Linux, Wayland (developed on KDE Plasma 6)
 - Python 3.10+
 - `pipewire`/`pulseaudio` (`pw-record`, `parecord`, or `arecord`)
+- `ffmpeg` — for mic conditioning (optional; `VD_CLEAN=0` runs without it)
 - [`ydotool`](https://github.com/ReimuNotMoe/ydotool) + `ydotoold` running
 - `wl-clipboard` (`wl-copy`)
 - `libnotify` (`notify-send`), `pulseaudio-utils`/`pipewire` (`paplay`)
@@ -142,6 +174,15 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VD_PROMPT` | *(empty)* | `initial_prompt` to bias recognition toward your vocabulary (names, jargon, tickers) |
 | `VD_BEAM` | `5` | decoding beam size; `1` = greedy (faster, slightly less accurate) |
 | `VD_TRAILING` | *(one space)* | text appended after each dictation so phrases don't glue together; `\n`/`\t` honoured, empty to disable |
+
+### Mic conditioning
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VD_CLEAN` | `1` | master switch; `0` (or no `ffmpeg`) = raw 16 kHz capture, no post-processing |
+| `VD_REC_RATE` | `48000` | capture sample rate for the conditioned path (the card's cleaner altset) |
+| `VD_REC_CH` | `2` | capture channels for the conditioned path |
+| `VD_CLEAN_FILTER` | *(tuned chain)* | ffmpeg `-af` chain: high-pass · denoise · speech-level · limiter. Empty = resample only. Swap `afftdn` → `arnndn=m=<model.rnnn>` for RNNoise AI denoise |
 
 ### Polish mode
 
