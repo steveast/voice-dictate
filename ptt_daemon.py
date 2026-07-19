@@ -30,6 +30,13 @@ Config via env:
                          (default: Ctrl+V "29:1 47:1 47:0 29:0";
                           terminals: Ctrl+Shift+V "29:1 42:1 47:1 47:0 42:0 29:0")
   VD_MIN_MS             ignore presses shorter than this   (default: 250)
+  VD_PROMPT             initial_prompt to bias recognition toward your own
+                        vocabulary (names, jargon, tickers)      (default: none)
+  VD_BEAM               beam size; 1 = greedy (faster, slightly
+                        less accurate)                           (default: 5)
+  VD_TRAILING           text appended after each dictation so back-to-back
+                        phrases don't glue together; \n / \t honoured
+                        (default: one space; set empty to disable)
 
 The dictated text is left sitting in the clipboard after pasting (not restored),
 so if the auto-paste misses — e.g. focus moved away from the field — you can just
@@ -63,6 +70,13 @@ MIN_MS = int(os.environ.get("VD_MIN_MS", "250"))
 # Safety cap: force-stop a recording that somehow never received a key release,
 # so a stuck "recording" notification can never hang indefinitely.
 MAX_REC = float(os.environ.get("VD_MAX_SEC", "180"))
+# Bias recognition toward a custom vocabulary (names, jargon, tickers).
+PROMPT = os.environ.get("VD_PROMPT", "").strip() or None
+# Decoding beam width; 1 = greedy decode (faster, marginally less accurate).
+BEAM = int(os.environ.get("VD_BEAM", "5"))
+# Appended after each dictation so consecutive phrases don't run together.
+# Backslash escapes (\n, \t) are honoured; default is a single space.
+TRAILING = os.environ.get("VD_TRAILING", " ").replace("\\n", "\n").replace("\\t", "\t")
 
 START_WAV = os.path.join(BASE, "start.wav")
 STOP_WAV = os.path.join(BASE, "stop.wav")
@@ -201,7 +215,8 @@ class Dictation:
             lang = None if LANG == "auto" else LANG
             t1 = time.time()
             segments, _ = self.model.transcribe(audio, language=lang,
-                                                beam_size=5, vad_filter=True)
+                                                beam_size=BEAM, vad_filter=True,
+                                                initial_prompt=PROMPT)
             text = "".join(s.text for s in segments).strip()
             log(f"transcribed {audio.size / 16000:.1f}s in {time.time() - t1:.1f}s "
                 f"-> {len(text)} chars")
@@ -224,8 +239,10 @@ class Dictation:
         # the paste misses, but the text stays in the clipboard so it can be
         # pasted by hand. (KWin exposes no virtual-keyboard / input-method-v2
         # protocol, so a real clipboard-free Unicode type is not possible here.)
+        # TRAILING is appended so back-to-back dictations don't glue together.
         try:
-            subprocess.run(["wl-copy"], input=text.encode("utf-8"), check=False)
+            subprocess.run(["wl-copy"], input=(text + TRAILING).encode("utf-8"),
+                           check=False)
         except OSError:
             log("wl-copy missing")
             return

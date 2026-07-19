@@ -110,6 +110,9 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
 | `VD_MIN_MS` | `250` | ignore presses shorter than this |
 | `VD_MAX_SEC` | `180` | safety cap on a single recording |
+| `VD_PROMPT` | *(empty)* | `initial_prompt` to bias recognition toward your vocabulary (names, jargon, tickers) |
+| `VD_BEAM` | `5` | decoding beam size; `1` = greedy (faster, slightly less accurate) |
+| `VD_TRAILING` | *(one space)* | text appended after each dictation so phrases don't glue together; `\n`/`\t` honoured, empty to disable |
 
 ## 🩺 Troubleshooting
 
