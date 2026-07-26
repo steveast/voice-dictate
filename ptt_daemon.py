@@ -32,6 +32,10 @@ Config via env:
   VD_MIN_MS             ignore presses shorter than this   (default: 250)
   VD_PROMPT             initial_prompt to bias recognition toward your own
                         vocabulary (names, jargon, tickers)      (default: none)
+                        Hard limit 223 tokens: whisper keeps only the tail of a
+                        longer prompt and drops the front silently, so spend the
+                        budget on words that actually get misheard. The daemon
+                        logs the count at startup and warns on overflow.
   VD_BEAM               beam size; 1 = greedy (faster, slightly
                         less accurate)                           (default: 5)
   VD_TRAILING           text appended after each dictation so back-to-back
@@ -287,6 +291,31 @@ def pretty_combo(mod_codes, main_code):
     return "+".join(parts)
 
 
+def warn_if_prompt_truncated(model):
+    """Whisper only has room for `max_length // 2 - 1` (=223) prompt tokens, and
+    faster-whisper silently keeps the *tail* of a longer initial_prompt — the
+    vocabulary at the front is dropped with no error and no log line. That looks
+    exactly like the model simply mishearing those words, so say it out loud."""
+    if not PROMPT:
+        return
+    budget = model.max_length // 2 - 1
+    try:
+        # add_special_tokens=False mirrors faster-whisper's own Tokenizer.encode,
+        # so the count matches what transcribe() will actually budget.
+        ids = model.hf_tokenizer.encode(" " + PROMPT, add_special_tokens=False).ids
+    except Exception as e:  # noqa: BLE001 - never let a warning break startup
+        log("prompt length check skipped:", repr(e))
+        return
+    if len(ids) <= budget:
+        log(f"VD_PROMPT: {len(ids)}/{budget} tokens")
+        return
+    dropped = model.hf_tokenizer.decode(ids[:len(ids) - budget])
+    log(f"VD_PROMPT too long: {len(ids)}/{budget} tokens — whisper keeps only "
+        f"the last {budget}. Silently dropped from the front: {dropped!r}")
+    notify(f"⚠️ VD_PROMPT длиннее лимита: {len(ids)}/{budget} токенов, "
+           "начало словаря отброшено", 6000)
+
+
 def polish_text(text):
     """Rewrite dictated text through a Claude model, reusing the Claude Code
     CLI's stored OAuth token. Returns (polished, err): `polished` is the cleaned
@@ -509,6 +538,7 @@ def main():
     t0 = time.time()
     model = WhisperModel(MODEL, device="cpu", compute_type=COMPUTE,
                          cpu_threads=THREADS)
+    warn_if_prompt_truncated(model)
     log(f"model ready in {time.time() - t0:.1f}s; hold {combo} to dictate"
         + (f", {polish_combo} to polish" if polish_enabled else ""))
     notify(f"🚀 Готово: {combo} — диктовка" +

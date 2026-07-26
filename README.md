@@ -171,9 +171,26 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
 | `VD_MIN_MS` | `250` | ignore presses shorter than this |
 | `VD_MAX_SEC` | `180` | safety cap on a single recording |
-| `VD_PROMPT` | *(empty)* | `initial_prompt` to bias recognition toward your vocabulary (names, jargon, tickers) |
+| `VD_PROMPT` | *(empty)* | `initial_prompt` to bias recognition toward your vocabulary (names, jargon, tickers). **Max 223 tokens** — see below |
 | `VD_BEAM` | `5` | decoding beam size; `1` = greedy (faster, slightly less accurate) |
 | `VD_TRAILING` | *(one space)* | text appended after each dictation so phrases don't glue together; `\n`/`\t` honoured, empty to disable |
+
+#### The 223-token prompt budget
+
+Whisper reserves `max_length // 2 - 1` = **223 tokens** for the prompt, and
+faster-whisper keeps the **tail** of anything longer — the vocabulary at the
+front is dropped with no error and no log line. The symptom is indistinguishable
+from the model simply mishearing those words.
+
+The daemon logs the count on startup (`VD_PROMPT: 153/223 tokens`) and warns
+loudly on overflow, naming the terms it had to drop.
+
+Because the budget is tight, spend it on words that actually get misheard.
+Common anglicisms whisper already knows (`докер`, `лог`, `кэш`, `React`,
+`PostgreSQL`) are wasted tokens; project-specific identifiers and proper nouns
+(`book_ticker`, `BTCUSDT`, `msx`, `материализатор`) are what the bias is for.
+Note that the prompt only helps words that are *in* it, so every wasted token is
+a term you dropped.
 
 ### Mic conditioning
 
