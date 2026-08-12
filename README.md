@@ -88,6 +88,37 @@ hold polish key ──▶ pw-record ──▶ faster-whisper ──▶ Claude (r
 > emit a modifier combo. If that gets in the way, remap the physical key to an
 > inert one (e.g. `F24`) with a udev `hwdb` rule and point `VD_POLISH_KEY` at it.
 
+## ⏱️ Latency
+
+Releasing the key never blocks: the take goes to a worker thread and you can
+start the next one immediately, so a thought that arrives mid-transcription is
+no longer lost. Takes are recognised in the order spoken and each is pasted the
+moment it is ready, between presses — never into a recording that is already
+running.
+
+That hides the wait but doesn't shorten it, and on CPU the wait is mostly
+**fixed**: whisper always encodes a padded 30-second window, so a 2-second take
+costs nearly as much as a 20-second one. Two things follow.
+
+`large-v3-turbo` is the wrong instinct for short dictation. Turbo shrinks the
+*decoder*; its encoder is the full large-v3 one, and the encoder is what a short
+take pays for. Measured on a Core Ultra 7 255H, 2-second take / 20-second take:
+
+| model | 2s take | 20s take |
+|---|---|---|
+| `small` | 1.25 s | 2.20 s |
+| `medium` | 3.19 s | 5.18 s |
+| `large-v3-turbo` | 5.12 s | 5.93 s |
+
+And more threads is not more speed on a hybrid CPU: ctranslate2 splits each
+layer evenly, so P-cores idle while E-cores finish. 16 threads measured *slower*
+than 8. Hence the `min(8, cores)` default.
+
+Whisper also competes with whatever else is running — a busy browser can triple
+these numbers. There is no CUDA path on Intel Arc, so `int8` on CPU is the
+ceiling here; beam size, `initial_prompt` and the VAD filter all measured within
+noise and are not worth tuning for speed.
+
 ## 🎚️ Mic conditioning (optional, on by default)
 
 Cheap USB mics are quiet and noisy. But route dictation through the *system*
@@ -173,10 +204,12 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 |---|---|---|
 | `VD_PTT_KEY` | `KEY_RIGHTCTRL` | evdev key to hold ([key names](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h)) |
 | `VD_PTT_MOD` | *(empty)* | optional modifier(s), comma-separated; empty = single-key hold |
+| `VD_PTT_KEY_2` | *(empty)* | second dictation key, bound to its own language; empty = off |
+| `VD_PTT_LANG_2` | `en` | language for that second key |
 | `VOICE_DICTATE_MODEL` | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | model id / size / path |
 | `VOICE_DICTATE_LANG` | `ru` | language code, or `auto` to detect per press — see below |
 | `VOICE_DICTATE_COMPUTE` | `int8` | ctranslate2 compute type |
-| `VOICE_DICTATE_THREADS` | all cores | CPU threads |
+| `VOICE_DICTATE_THREADS` | `min(8, cores)` | CPU threads; capped because hybrid P/E-core CPUs get *slower* with all of them |
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
 | `VD_MIN_MS` | `250` | ignore presses shorter than this |
 | `VD_RESCAN_SEC` | `2` | how often to look for keyboards plugged in after startup |
@@ -204,17 +237,39 @@ a term you dropped.
 
 #### Speaking two languages
 
-Set `VOICE_DICTATE_LANG=auto` and whisper picks the language per press — both
-keys, since verbatim and polish share one transcribe call. Detection runs on the
-encoder output and never sees `VD_PROMPT`, so the glossary cannot skew *which*
-language is chosen. It does steer the decode though, so a Russian-only glossary
-drags English dictation toward transliteration: give the prompt a clause per
-language you actually speak, within the same 223-token budget.
+Two ways, and the cheap one is a key per language:
 
-Two limits worth knowing. The language is decided once per press from the first
-window, so one take is one language — a Russian sentence with English terms is a
-`VD_PROMPT` job, not a detection job. And very short takes ("okay", "ага") carry
-too little signal to classify reliably.
+```
+VD_PTT_KEY=KEY_RIGHTCTRL        VOICE_DICTATE_LANG=ru   # hold for Russian
+VD_PTT_KEY_2=KEY_F23,KEY_F24    VD_PTT_LANG_2=en        # hold for English
+```
+
+Pick a genuinely spare key for the second language. Right Alt looks tempting and
+is a trap: it is AltGr, so on a multi-layout desktop holding it switches the
+keyboard layout out from under you. Comma-separate several keys when your
+keyboards don't share a spare one — any of them starts an English take.
+
+Naming the language beats detecting it on both counts. Detection is an extra
+encoder pass over the padded 30-second window — about **1.8x** the cost of a
+short take — and it is unreliable exactly where dictation is shortest: a 1.5s
+Russian clip came back as English from every model size tested, `small` and
+`large-v3-turbo` alike. A key you are already holding carries the same
+information for free.
+
+The alternative is `VOICE_DICTATE_LANG=auto`, which lets whisper decide per
+press. Detection runs on the encoder output and never sees `VD_PROMPT`, so the
+glossary cannot skew *which* language is chosen — but it does steer the decode,
+so a Russian-only glossary drags English dictation toward transliteration. Give
+the prompt a clause per language, within the same 223-token budget.
+
+Either way, one take is one language: a Russian sentence with English terms in
+it is a `VD_PROMPT` job, not a detection job.
+
+Polish sits on the chord — hold **both** dictation keys — so it costs no key of
+its own, and it is the one path that still detects the language (`VD_POLISH_LANG`,
+default `auto`), since the API call dominates its latency anyway. Press ordering
+does not matter: the recording starts on whichever key lands first and is
+re-labelled if the other joins, so nothing spoken is lost.
 
 Polish is told the detected language outright rather than inferring it from the
 text. "Keep the input language" is not enough on its own: the built-in
@@ -237,6 +292,8 @@ keep in mind the daemon appends the language directive after it.
 |---|---|---|
 | `VD_POLISH_KEY` | *(empty)* | dedicated key(s) for the polish hold; comma-separated for multiple keyboards; empty disables polish |
 | `VD_POLISH_MOD` | `Ctrl+Shift` | extra modifier groups (used only when no dedicated key is set) |
+| `VD_POLISH_CHORD` | `1` | holding both dictation keys at once means polish; needs `VD_PTT_KEY_2` |
+| `VD_POLISH_LANG` | `auto` | language for a polish take; `auto` detects it |
 | `VD_POLISH_MODEL` | `claude-haiku-4-5` | Claude model for the rewrite |
 | `VD_POLISH_PROMPT` | *(built-in)* | system prompt steering the rewrite |
 | `VD_POLISH_START_WAV` | `polish_start.wav` | distinct start beep for polish mode |

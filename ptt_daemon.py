@@ -23,8 +23,11 @@ Config via env:
   VOICE_DICTATE_LANG     language code, or "auto" to detect
                          the language on every press       (default: ru)
   VOICE_DICTATE_COMPUTE  ctranslate2 compute type          (default: int8)
-  VOICE_DICTATE_THREADS  CPU threads                       (default: all)
+  VOICE_DICTATE_THREADS  CPU threads                       (default: min(8, cores))
   VD_PTT_KEY             evdev main key name                (default: KEY_X)
+  VD_PTT_KEY_2           second dictation key, bound to its own language;
+                         empty = off                        (default: empty)
+  VD_PTT_LANG_2          language for that second key       (default: en)
   VD_PTT_MOD             modifier key name(s), comma/space separated, or empty
                          for a plain single-key hold  (default: KEY_LEFTALT,KEY_RIGHTALT)
   VD_PASTE_KEYS          ydotool key codes for paste
@@ -76,6 +79,10 @@ hint is shown. Config via env:
                         held. Polish is off only if VD_POLISH_KEY and this are
                         both empty.
                         (default: KEY_LEFTCTRL,KEY_RIGHTCTRL KEY_LEFTSHIFT,KEY_RIGHTSHIFT)
+  VD_POLISH_CHORD       holding both dictation keys at once means polish;
+                        needs VD_PTT_KEY_2                 (default: 1)
+  VD_POLISH_LANG        language for a polish take, "auto"
+                        to detect it                       (default: auto)
   VD_POLISH_MODEL       Claude model id            (default: claude-haiku-4-5)
   VD_POLISH_PROMPT      system prompt for the rewrite (has a sensible default)
   VD_POLISH_MAX_TOKENS  response cap               (default: 1024)
@@ -95,7 +102,9 @@ import sys
 import time
 import wave
 import json
+import queue
 import signal
+import threading
 import selectors
 import subprocess
 import urllib.request
@@ -107,18 +116,40 @@ from evdev import ecodes
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 RUNDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "voice-dictate")
+# One pair of files per take, numbered: recording must be able to start again
+# while the previous take is still being transcribed, and a single fixed path
+# would have the new recorder overwrite the audio still queued for whisper.
+# ptt.wav / ptt.clean.wav stay as symlink-free copies of the most recent take so
+# compare-models.sh keeps working.
 WAV = os.path.join(RUNDIR, "ptt.wav")
-# The conditioned (denoised/leveled/16 kHz-mono) copy ffmpeg writes; whisper
-# reads this instead of WAV when conditioning is on and succeeds.
 CLEAN_WAV = os.path.join(RUNDIR, "ptt.clean.wav")
+
+
+def take_paths(seq):
+    """Audio paths for take `seq`: the raw capture and the conditioned copy."""
+    return (os.path.join(RUNDIR, f"ptt.{seq}.wav"),
+            os.path.join(RUNDIR, f"ptt.{seq}.clean.wav"))
 
 MODEL = os.environ.get("VOICE_DICTATE_MODEL",
                        "mobiuslabsgmbh/faster-whisper-large-v3-turbo")
 LANG = os.environ.get("VOICE_DICTATE_LANG", "ru")
 COMPUTE = os.environ.get("VOICE_DICTATE_COMPUTE", "int8")
-THREADS = int(os.environ.get("VOICE_DICTATE_THREADS", "0")) or (os.cpu_count() or 4)
+# Capped rather than "every core". Modern hybrid CPUs mix fast P-cores with
+# slow E-cores, and ctranslate2 splits each layer evenly across whatever it is
+# given — so the P-cores sit waiting on the E-cores and the whole take runs at
+# E-core pace. Measured on a Core Ultra 7 255H (6P + 8E + 2LP): 16 threads 8.3s,
+# 8 threads 6.1s for the same audio. Raise it with VOICE_DICTATE_THREADS on a
+# machine whose cores are all equal.
+THREADS = (int(os.environ.get("VOICE_DICTATE_THREADS", "0"))
+           or min(8, os.cpu_count() or 4))
 PTT_KEY = os.environ.get("VD_PTT_KEY", "KEY_X")
 PTT_MOD = os.environ.get("VD_PTT_MOD", "KEY_LEFTALT,KEY_RIGHTALT")
+# A second dictation key bound to a second language. Naming the language per key
+# is what makes it fast: whisper's own detection costs a whole extra encoder
+# pass (measured ~1.8x on a short take), and it is unreliable on brief audio
+# anyway. Empty = no second key, and VOICE_DICTATE_LANG governs everything.
+PTT_KEY_2 = os.environ.get("VD_PTT_KEY_2", "").strip()
+PTT_LANG_2 = os.environ.get("VD_PTT_LANG_2", "en")
 PASTE_KEYS = os.environ.get("VD_PASTE_KEYS", "29:1 47:1 47:0 29:0").split()
 MIN_MS = int(os.environ.get("VD_MIN_MS", "250"))
 # Safety cap: force-stop a recording that somehow never received a key release,
@@ -165,6 +196,14 @@ CLEAN_FILTER = os.environ.get(
 # model before pasting (the normal chord stays verbatim). Off if POLISH_MOD is
 # empty. Reuses the Claude Code CLI's OAuth token so no separate key is needed.
 POLISH_KEY = os.environ.get("VD_POLISH_KEY", "").strip()
+# Holding both dictation keys at once means polish. It costs no extra key, and
+# the usual objection to chords — press ordering — does not apply here: the
+# recording starts on whichever key lands first and is simply re-labelled if the
+# other joins, so no audio is lost either way. Language for a polish take is
+# detected (the API call dominates, so the extra encoder pass hardly shows).
+POLISH_CHORD = os.environ.get("VD_POLISH_CHORD", "1").strip().lower() not in (
+    "0", "false", "no", "")
+POLISH_LANG = os.environ.get("VD_POLISH_LANG", "auto")
 POLISH_MOD = os.environ.get(
     "VD_POLISH_MOD", "KEY_LEFTCTRL,KEY_RIGHTCTRL KEY_LEFTSHIFT,KEY_RIGHTSHIFT")
 POLISH_MODEL = os.environ.get("VD_POLISH_MODEL", "claude-haiku-4-5")
@@ -426,44 +465,68 @@ def polish_text(text, lang=None):
         return None, "сеть/таймаут"
 
 
+class Take:
+    """One press worth of audio, handed from the main loop to the worker."""
+    __slots__ = ("seq", "wav", "clean", "mode", "lang")
+
+    def __init__(self, seq, wav, clean, mode, lang):
+        self.seq, self.wav, self.clean = seq, wav, clean
+        self.mode, self.lang = mode, lang
+
+
 class Dictation:
     def __init__(self, model, recorder):
         self.model = model
         self.recorder = recorder
         self.proc = None
         self.t0 = 0.0
+        self.seq = 0                    # take counter; names the audio files
+        self.wav = WAV
+        self.clean = CLEAN_WAV
         self.mode = "verbatim"          # or "polish"; set per press in start()
-        self.lang = None                # whisper's detected language, per take
+        self.lang = LANG                # language for this take, from its key
 
     @property
     def active(self):
         return self.proc is not None
 
-    def start(self, mode="verbatim"):
+    def promote(self, mode, lang):
+        """Re-label a recording that is already running (the polish chord was
+        completed after the first key went down)."""
+        self.mode, self.lang = mode, lang
+        notify("✨ Причешу этот кусок", 2000)
+        log(f"take promoted to mode={mode} lang={lang}")
+
+    def start(self, mode="verbatim", lang=None):
         if self.proc is not None:
             return
         self.mode = mode
-        self.lang = None                # cleared so a failed take can't leak
-                                        # the previous take's language
+        self.lang = LANG if lang is None else lang
+        self.seq += 1
+        self.wav, self.clean = take_paths(self.seq)
         os.makedirs(RUNDIR, exist_ok=True)
-        try:
-            os.unlink(WAV)
-        except OSError:
-            pass
+        for stale in (self.wav, self.clean):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
         self.t0 = time.time()
-        self.proc = subprocess.Popen(self.recorder + [WAV],
+        self.proc = subprocess.Popen(self.recorder + [self.wav],
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         beep(POLISH_START_WAV if mode == "polish" and os.path.exists(POLISH_START_WAV)
              else START_WAV)
         notify("✨🎙️ Запись… (причешу)" if mode == "polish"
                else "🎙️ Запись… (держи клавишу)", 10000)
-        log(f"recording started (mode={mode})")
+        log(f"recording started (mode={mode} lang={self.lang})")
 
-    def stop_and_transcribe(self):
-        """Stop the recorder and return the recognized text (or "")."""
+    def stop(self):
+        """Stop the recorder and hand back the take for transcription, or None
+        when there is nothing worth transcribing. Deliberately cheap — the main
+        loop returns to reading the keyboard immediately, so the next thought
+        can be recorded while this one is still going through whisper."""
         if self.proc is None:
-            return ""
+            return None
         held_ms = (time.time() - self.t0) * 1000
         self.proc.send_signal(signal.SIGINT)
         try:
@@ -473,41 +536,65 @@ class Dictation:
         self.proc = None
         beep(STOP_WAV)
 
+        take = Take(self.seq, self.wav, self.clean, self.mode, self.lang)
         if held_ms < MIN_MS:
             notify("⏱️ Слишком коротко", 1500)
             log(f"press too short ({held_ms:.0f}ms), ignored")
-            return ""
-        if not os.path.exists(WAV) or os.path.getsize(WAV) < 1000:
+            self.discard(take)
+            return None
+        if not os.path.exists(take.wav) or os.path.getsize(take.wav) < 1000:
             notify("🔇 Пустая запись", 2000)
-            return ""
+            self.discard(take)
+            return None
+        return take
 
+    @staticmethod
+    def discard(take):
+        for path in (take.wav, take.clean):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def retire(take):
+        """Fold a finished take's audio back onto the fixed ptt.wav names. This
+        is the cleanup for the numbered files (they must not pile up) and it
+        keeps compare-models.sh, which reads the fixed path, pointed at the most
+        recent dictation."""
+        for src, dst in ((take.wav, WAV), (take.clean, CLEAN_WAV)):
+            try:
+                os.replace(src, dst)
+            except OSError:
+                pass
+
+    def transcribe(self, take):
+        """The slow half: condition the audio and recognise it. Runs on the
+        worker thread. Returns (text, language)."""
         notify("✍️ Расшифровка…", 3000)
         # Clean & level the recording (denoise, boost, resample) before whisper
         # sees it. Best-effort: on any ffmpeg failure we transcribe the raw WAV.
-        src = WAV
-        if CLEAN and on_path("ffmpeg") and condition_wav(WAV, CLEAN_WAV):
-            src = CLEAN_WAV
+        src = take.wav
+        if CLEAN and on_path("ffmpeg") and condition_wav(take.wav, take.clean):
+            src = take.clean
         try:
             audio = load_wav(src)
-            lang = None if LANG == "auto" else LANG
+            lang = None if take.lang == "auto" else take.lang
             t1 = time.time()
             segments, info = self.model.transcribe(audio, language=lang,
                                                    beam_size=BEAM, vad_filter=True,
                                                    initial_prompt=PROMPT)
             text = "".join(s.text for s in segments).strip()
-            # Remember what whisper heard so polish can be told the language
-            # outright instead of guessing it from the text.
-            self.lang = info.language
             log(f"transcribed {audio.size / 16000:.1f}s in {time.time() - t1:.1f}s "
                 f"-> {len(text)} chars, lang={info.language} "
                 f"p={info.language_probability:.2f}")
             if not text:
                 notify("🤷 Ничего не распознано", 2000)
-            return text
+            return text, info.language
         except Exception as e:  # noqa: BLE001
             log("transcribe error:", repr(e))
             notify("❌ Ошибка распознавания", 3000)
-            return ""
+            return "", None
 
     def paste(self, text):
         env = dict(os.environ)
@@ -603,6 +690,12 @@ def main():
     polish_combo = ("/".join(pretty_combo([min(g) for g in polish_groups], m)
                              for m in sorted(polish_mains)) if polish_enabled else "")
 
+    # Second dictation key, bound to its own language.
+    lang2_codes = {getattr(ecodes, k) for k in PTT_KEY_2.replace(",", " ").split()
+                   if hasattr(ecodes, k)}
+    chord_polish = POLISH_CHORD and bool(lang2_codes)
+    lang2_combo = "/".join(sorted(pretty_combo([], c) for c in lang2_codes))
+
     # With conditioning on, capture the richer 48 kHz/stereo altset and let
     # ffmpeg resample; otherwise record straight to whisper's 16 kHz/mono.
     clean_on = CLEAN and on_path("ffmpeg")
@@ -615,7 +708,7 @@ def main():
            else "off (raw 16k mono)"
                 + ("; VD_CLEAN=0" if not CLEAN else "; ffmpeg not found")))
 
-    devs = open_keyboards({main_code} | polish_mains)
+    devs = open_keyboards({main_code} | polish_mains | lang2_codes)
     if not devs:
         log(f"no keyboard exposes {PTT_KEY}"
             + (f"/{POLISH_KEY}" if POLISH_KEY else "")
@@ -628,15 +721,61 @@ def main():
     model = WhisperModel(MODEL, device="cpu", compute_type=COMPUTE,
                          cpu_threads=THREADS)
     warn_if_prompt_truncated(model)
-    log(f"model ready in {time.time() - t0:.1f}s; hold {combo} to dictate"
-        + (f", {polish_combo} to polish" if polish_enabled else ""))
-    notify(f"🚀 Готово: {combo} — диктовка" +
-           (f", {polish_combo} — причесать ✨" if polish_enabled else ""), 4000)
+    bindings = [f"{combo} -> {LANG}"]
+    if lang2_codes:
+        bindings.append(f"{lang2_combo} -> {PTT_LANG_2}")
+    if chord_polish:
+        bindings.append(f"{combo}+{lang2_combo} -> polish ({POLISH_LANG})")
+    if polish_enabled:
+        bindings.append(f"{polish_combo} -> polish ({POLISH_LANG})")
+    log(f"model ready in {time.time() - t0:.1f}s; " + ", ".join(bindings))
+    notify(f"🚀 Готово: {combo} — {LANG}"
+           + (f", {lang2_combo} — {PTT_LANG_2}" if lang2_codes else "")
+           + (f", вместе — причесать ✨" if chord_polish else "")
+           + (f", {polish_combo} — причесать ✨" if polish_enabled else ""), 5000)
 
     dictation = Dictation(model, recorder)
     sel = selectors.DefaultSelector()
     for d in devs:
         sel.register(d, selectors.EVENT_READ)
+
+    # Numbered takes left by a run that was killed with work still queued. The
+    # glob needs the digit: plain ptt.*.wav would also match ptt.clean.wav, the
+    # last-recording copy compare-models.sh reads.
+    import glob
+    for stale in glob.glob(os.path.join(RUNDIR, "ptt.[0-9]*.wav")):
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
+
+    # Transcription runs on a worker thread so releasing the key never blocks
+    # the keyboard. Whisper needs seconds per take, and that wait used to swallow
+    # the next press entirely: a thought that arrived while the previous one was
+    # still being recognised simply could not be recorded. One worker, so takes
+    # stay in the order they were spoken. The pipe wakes the select() below the
+    # moment a result is ready.
+    jobs = queue.Queue()
+    results = queue.Queue()
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    sel.register(wake_r, selectors.EVENT_READ, data="wake")
+
+    def worker():
+        while True:
+            take = jobs.get()
+            text, lang = dictation.transcribe(take)
+            err = None
+            if text and take.mode == "polish":
+                notify("✨ Причёсываю…", 8000)
+                polished, err = polish_text(text, lang)
+                if polished:
+                    text, err = polished, None
+            dictation.retire(take)
+            results.put((text, err))
+            os.write(wake_w, b"x")
+
+    threading.Thread(target=worker, daemon=True).start()
 
     trigger_codes = {main_code} | polish_mains
     examined = set()                    # nodes already ruled out, so a rescan
@@ -699,22 +838,29 @@ def main():
                 drop_device(d, "went away")
         verb_held = (main_code in active
                      and (bool(mod_codes & active) or not require_mod))
+        lang2_held = bool(lang2_codes & active)
         polish_held = (polish_enabled and bool(polish_mains & active)
                        and all(g & active for g in polish_groups))
-        return verb_held, polish_held
+        # Both dictation keys down = polish, whichever landed first.
+        if chord_polish and verb_held and lang2_held:
+            polish_held = True
+        return verb_held, lang2_held, polish_held
 
     def drain_ready(timeout):
         """Consume queued events so select() doesn't spin. The details don't
         matter — the real chord state is read from triggers_now(), not here."""
         for key, _ in sel.select(timeout):
+            if key.data == "wake":          # the worker finished a take
+                try:
+                    os.read(key.fd, 4096)
+                except OSError:
+                    pass
+                continue
             try:
                 for _ in key.fileobj.read():
                     pass
-            except OSError:
-                try:
-                    sel.unregister(key.fileobj)
-                except (KeyError, ValueError):
-                    pass
+            except Exception:  # noqa: BLE001 — OSError or the bare SystemError
+                drop_device(key.fileobj, "went away")  # described in triggers_now
 
     def wait_mod_release(timeout=1.5):
         """Before pasting, wait for the trigger keys to be physically released,
@@ -722,26 +868,31 @@ def main():
         (Ctrl+Alt+V, Ctrl+Shift+V) and doesn't paste."""
         end = time.time() + timeout
         while time.time() < end:
-            verb_held, polish_held = triggers_now()
-            if not (verb_held or polish_held):
+            verb_held, lang2_held, polish_held = triggers_now()
+            if not (verb_held or lang2_held or polish_held):
                 break
             drain_ready(0.05)
 
     def finish():
-        mode = dictation.mode
-        text = dictation.stop_and_transcribe()
-        # Polish first: the ~2s API call overlaps the user releasing the chord.
-        if text and mode == "polish":
-            notify("✨ Причёсываю…", 8000)
-            polished, err = polish_text(text, dictation.lang)
-            if polished:
-                text = polished
-            else:
-                notify("⚠️ Без причёсывания: " + (err or "ошибка"), 3000)
-        wait_mod_release()
-        if text:
-            dictation.paste(text)
-            notify("📋 " + text, 4000)
+        take = dictation.stop()
+        if take is not None:
+            jobs.put(take)
+
+    def paste_ready():
+        """Hand finished takes to the clipboard, oldest first. Only ever called
+        between takes: injecting Ctrl+V while the next press is already recording
+        would land the text wherever focus has moved to and fight the held key."""
+        while True:
+            try:
+                text, err = results.get_nowait()
+            except queue.Empty:
+                return
+            if err:
+                notify("⚠️ Без причёсывания: " + err, 3000)
+            if text:
+                wait_mod_release()
+                dictation.paste(text)
+                notify("📋 " + text, 4000)
 
     # Event-driven when idle; while recording, wake every 0.5s to re-check the
     # real key state (self-heals a missed release) and enforce the safety cap.
@@ -755,22 +906,31 @@ def main():
         if not dictation.active and time.time() >= next_scan:
             next_scan = time.time() + RESCAN_SEC
             rescan()
-        verb_held, polish_held = triggers_now()
-        # Polish wins when its trigger is held (the verbatim and polish keys are
-        # distinct, so normally only one is held at a time).
+        verb_held, lang2_held, polish_held = triggers_now()
+        # Polish wins: it is either its own key, or both dictation keys at once.
         if polish_held:
-            want = "polish"
+            want, want_lang = "polish", POLISH_LANG
         elif verb_held:
-            want = "verbatim"
+            want, want_lang = "verbatim", LANG
+        elif lang2_held:
+            want, want_lang = "verbatim", PTT_LANG_2
         else:
-            want = None
+            want, want_lang = None, None
         chord_held = want is not None
+
+        if not chord_held and not dictation.active:
+            paste_ready()
 
         if not chord_held:
             armed = True                      # a fresh press is required to start
         if chord_held and armed and not dictation.active:
-            dictation.start(want)
+            dictation.start(want, want_lang)
             armed = False
+        elif dictation.active and want == "polish" and dictation.mode != "polish":
+            # The second key joined a recording that started as plain dictation.
+            # Re-label it rather than restarting: mode and language only matter
+            # when the audio reaches whisper, so nothing spoken so far is lost.
+            dictation.promote("polish", POLISH_LANG)
         elif dictation.active and not chord_held:
             finish()
         elif dictation.active and (time.time() - dictation.t0) > MAX_REC:
