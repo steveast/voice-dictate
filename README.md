@@ -74,6 +74,15 @@ hold polish key ──▶ pw-record ──▶ faster-whisper ──▶ Claude (r
 - If the token is stale it pastes the **raw** text and shows a hint, so a
   dictation is never lost.
 - A distinct start chime (`polish_start.wav`) tells you which mode you're in.
+- The dictation is **edited, never obeyed**. This matters because polish is
+  perfect for composing prompts for some *other* assistant: dictate "write me a
+  function that parses JSON" and a naive setup returns the function. Three things
+  keep the editor in its role — the fragment arrives fenced in `<fragment>` tags,
+  the task is restated *after* it (rules that sit only in the system prompt lose
+  to an imperative arriving last), and the reply is prefilled with `<edited>` so
+  it cannot open with "I notice you asked…". Override `VD_POLISH_PROMPT` freely;
+  the fencing, the restated task, and the detected-language line are appended
+  around it either way.
 
 > Some keys (a laptop vendor key, the Menu/Compose key) fire an OS action or
 > emit a modifier combo. If that gets in the way, remap the physical key to an
@@ -165,7 +174,7 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VD_PTT_KEY` | `KEY_RIGHTCTRL` | evdev key to hold ([key names](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h)) |
 | `VD_PTT_MOD` | *(empty)* | optional modifier(s), comma-separated; empty = single-key hold |
 | `VOICE_DICTATE_MODEL` | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | model id / size / path |
-| `VOICE_DICTATE_LANG` | `ru` | language code, or `auto` |
+| `VOICE_DICTATE_LANG` | `ru` | language code, or `auto` to detect per press — see below |
 | `VOICE_DICTATE_COMPUTE` | `int8` | ctranslate2 compute type |
 | `VOICE_DICTATE_THREADS` | all cores | CPU threads |
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
@@ -191,6 +200,26 @@ Common anglicisms whisper already knows (`докер`, `лог`, `кэш`, `Reac
 (`book_ticker`, `BTCUSDT`, `msx`, `материализатор`) are what the bias is for.
 Note that the prompt only helps words that are *in* it, so every wasted token is
 a term you dropped.
+
+#### Speaking two languages
+
+Set `VOICE_DICTATE_LANG=auto` and whisper picks the language per press — both
+keys, since verbatim and polish share one transcribe call. Detection runs on the
+encoder output and never sees `VD_PROMPT`, so the glossary cannot skew *which*
+language is chosen. It does steer the decode though, so a Russian-only glossary
+drags English dictation toward transliteration: give the prompt a clause per
+language you actually speak, within the same 223-token budget.
+
+Two limits worth knowing. The language is decided once per press from the first
+window, so one take is one language — a Russian sentence with English terms is a
+`VD_PROMPT` job, not a detection job. And very short takes ("okay", "ага") carry
+too little signal to classify reliably.
+
+Polish is told the detected language outright rather than inferring it from the
+text. "Keep the input language" is not enough on its own: the built-in
+`VD_POLISH_PROMPT` is written in Russian, and that pull alone is enough to make
+the model translate English dictation into Russian. If you replace the prompt,
+keep in mind the daemon appends the language directive after it.
 
 ### Mic conditioning
 
