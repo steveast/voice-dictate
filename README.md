@@ -179,6 +179,7 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VOICE_DICTATE_THREADS` | all cores | CPU threads |
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
 | `VD_MIN_MS` | `250` | ignore presses shorter than this |
+| `VD_RESCAN_SEC` | `2` | how often to look for keyboards plugged in after startup |
 | `VD_MAX_SEC` | `180` | safety cap on a single recording |
 | `VD_PROMPT` | *(empty)* | `initial_prompt` to bias recognition toward your vocabulary (names, jargon, tickers). **Max 223 tokens** — see below |
 | `VD_BEAM` | `5` | decoding beam size; `1` = greedy (faster, slightly less accurate) |
@@ -247,6 +248,10 @@ keep in mind the daemon appends the language directive after it.
 - **`no keyboard exposes …`** → you lack read access to `/dev/input` (see install step 1).
 - **Nothing pastes** → `ydotoold` isn't running or lacks `/dev/uinput` access (install step 2).
 - **The PTT key types a character** → you picked a printing key; use a modifier/spare key.
+- **A keyboard plugged in later does nothing** → shouldn't happen any more: the
+  daemon rescans `/dev/input` every `VD_RESCAN_SEC` and logs `keyboard plugged
+  in: …`. If that line never appears, the new node isn't readable — check the
+  install step 1 permissions, which udev applies per device.
 - **Cold start ~35 s once** → first model load; it stays warm afterwards.
 
 ## 📄 License

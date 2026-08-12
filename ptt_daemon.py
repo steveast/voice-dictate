@@ -31,6 +31,8 @@ Config via env:
                          (default: Ctrl+V "29:1 47:1 47:0 29:0";
                           terminals: Ctrl+Shift+V "29:1 42:1 47:1 47:0 42:0 29:0")
   VD_MIN_MS             ignore presses shorter than this   (default: 250)
+  VD_RESCAN_SEC         how often to look for keyboards
+                        plugged in after startup           (default: 2)
   VD_PROMPT             initial_prompt to bias recognition toward your own
                         vocabulary (names, jargon, tickers)      (default: none)
                         Hard limit 223 tokens: whisper keeps only the tail of a
@@ -122,6 +124,9 @@ MIN_MS = int(os.environ.get("VD_MIN_MS", "250"))
 # Safety cap: force-stop a recording that somehow never received a key release,
 # so a stuck "recording" notification can never hang indefinitely.
 MAX_REC = float(os.environ.get("VD_MAX_SEC", "180"))
+# How often to look for keyboards plugged in after startup. Cheap: a directory
+# listing, and an open() only for event nodes never seen before.
+RESCAN_SEC = float(os.environ.get("VD_RESCAN_SEC", "2"))
 # Bias recognition toward a custom vocabulary (names, jargon, tickers).
 PROMPT = os.environ.get("VD_PROMPT", "").strip() or None
 # Decoding beam width; 1 = greedy decode (faster, marginally less accurate).
@@ -540,17 +545,35 @@ def enumerate_event_paths():
     return paths
 
 
+def probe_keyboard(path, key_codes):
+    """Open one event node and classify it. Returns the InputDevice when it
+    exposes a trigger key, None when it was examined and does not, or False when
+    it could not be opened at all — a node udev has just created but not yet
+    applied the ACL to, which a later scan retries. Non-matching devices are
+    closed immediately: rescan() runs every couple of seconds, and leaking one
+    fd per node per scan would exhaust the process's descriptors."""
+    try:
+        d = evdev.InputDevice(path)
+    except OSError:
+        return False
+    try:
+        caps = d.capabilities().get(ecodes.EV_KEY, [])
+    except Exception:  # noqa: BLE001 — OSError, or SystemError straight from the
+        d.close()      # ioctl if the node is torn down while we are probing it
+        return False
+    if any(k in caps for k in key_codes):
+        return d
+    d.close()
+    return None
+
+
 def open_keyboards(key_codes):
     """Return InputDevice objects for every keyboard exposing any trigger key
     (the verbatim key or the polish key — they can live on different devices)."""
     devs = []
     for path in enumerate_event_paths():
-        try:
-            d = evdev.InputDevice(path)
-        except OSError:
-            continue
-        caps = d.capabilities().get(ecodes.EV_KEY, [])
-        if any(k in caps for k in key_codes):
+        d = probe_keyboard(path, key_codes)
+        if d:
             devs.append(d)
             log(f"listening on {d.path} ({d.name})")
     return devs
@@ -615,16 +638,65 @@ def main():
     for d in devs:
         sel.register(d, selectors.EVENT_READ)
 
+    trigger_codes = {main_code} | polish_mains
+    examined = set()                    # nodes already ruled out, so a rescan
+                                        # re-opens only genuinely new ones
+
+    def drop_device(d, why):
+        """Forget a device that has gone away, so triggers_now() stops polling a
+        dead fd and rescan() can examine the node afresh if it comes back."""
+        try:
+            sel.unregister(d)
+        except (KeyError, ValueError):
+            pass
+        try:
+            d.close()
+        except Exception:  # noqa: BLE001 — teardown, nothing left to salvage
+            pass
+        if d in devs:
+            devs.remove(d)
+        log(f"keyboard {why}: {d.path}")
+
+    def rescan():
+        """Pick up keyboards plugged in after startup, and drop unplugged ones.
+
+        Without this, /dev/input is enumerated once at boot and never again: a
+        USB keyboard attached later is invisible, and every press on it goes
+        nowhere while the daemon looks perfectly healthy in the log."""
+        try:
+            paths = set(evdev.list_devices())
+        except OSError:
+            return
+        for d in [d for d in devs if d.path not in paths]:
+            drop_device(d, "unplugged")
+        # Forget verdicts for vanished nodes so a re-plugged device is examined
+        # again — the kernel reuses event numbers for different hardware.
+        examined.intersection_update(paths)
+        for path in sorted(paths - {d.path for d in devs} - examined):
+            d = probe_keyboard(path, trigger_codes)
+            if d is False:
+                continue                # not readable yet; retry next scan
+            if d is None:
+                examined.add(path)
+                continue
+            devs.append(d)
+            sel.register(d, selectors.EVENT_READ)
+            log(f"keyboard plugged in: {d.path} ({d.name})")
+
     def triggers_now():
         """Ground-truth key state straight from the kernel (EVIOCGKEY). Immune
         to a missed press/release event, so the chord can never desync.
         Returns (verbatim held, polish held)."""
         active = set()
-        for d in devs:
+        for d in list(devs):
             try:
                 active.update(d.active_keys())
-            except OSError:
-                continue
+            except Exception:  # noqa: BLE001
+                # OSError once the node is gone, but python-evdev surfaces a bare
+                # SystemError from the raw ioctl when the device vanishes
+                # mid-call. That one is not an OSError, so it used to escape and
+                # kill the daemon outright the moment a keyboard was unplugged.
+                drop_device(d, "went away")
         verb_held = (main_code in active
                      and (bool(mod_codes & active) or not require_mod))
         polish_held = (polish_enabled and bool(polish_mains & active)
@@ -674,8 +746,15 @@ def main():
     # Event-driven when idle; while recording, wake every 0.5s to re-check the
     # real key state (self-heals a missed release) and enforce the safety cap.
     armed = True
+    next_scan = 0.0
     while True:
-        drain_ready(0.5 if dictation.active else None)
+        # Idle waits are bounded (rather than blocking forever) so the rescan
+        # below still runs on a machine that is sitting completely untouched —
+        # which is exactly when a keyboard gets plugged in.
+        drain_ready(0.5 if dictation.active else RESCAN_SEC)
+        if not dictation.active and time.time() >= next_scan:
+            next_scan = time.time() + RESCAN_SEC
+            rescan()
         verb_held, polish_held = triggers_now()
         # Polish wins when its trigger is held (the verbatim and polish keys are
         # distinct, so normally only one is held at a time).
