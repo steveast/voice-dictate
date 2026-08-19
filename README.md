@@ -1,148 +1,89 @@
+<div align="center">
+
+<img src="assets/waveform.gif" alt="A push-to-talk take: waveform while recording, text when it lands" width="860">
+
 # 🎙️ voice-dictate
 
-Push-to-talk voice dictation for **Wayland / KDE Plasma**, powered by
-[faster-whisper](https://github.com/SYSTRAN/faster-whisper). Hold a key, speak,
-release — the recognized text is typed into whatever window is focused. Tuned
-for **Russian** out of the box, but works with any Whisper language.
+**Push-to-talk voice dictation for Wayland / KDE Plasma.**
+Hold a key, speak, release — the text lands in whatever window is focused.
+
+<sub>
+Русский и английский · каждый на своей клавише · распознавание на Intel Arc iGPU
+</sub>
+
+<br>
+
+![platform](https://img.shields.io/badge/platform-Wayland%20%2F%20KDE-1f6feb?style=flat-square)
+![python](https://img.shields.io/badge/python-3.10%2B-3776ab?style=flat-square)
+![backend](https://img.shields.io/badge/backend-OpenVINO%20%C2%B7%20faster--whisper-a78bfa?style=flat-square)
+![speed](https://img.shields.io/badge/0.67s%20per%20take-Arc%20iGPU-58d6ff?style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-3fb950?style=flat-square)
+
+</div>
+
+---
 
 Built because on KDE Wayland the usual tricks don't work: `wtype` needs a
 virtual-keyboard protocol KWin doesn't expose, and `ydotool type` can't emit
-Cyrillic. This project takes a different route (see [How it works](#-how-it-works)).
+Cyrillic. This takes a different route — see [How it works](#-how-it-works).
 
 ## ✨ Features
 
-- **Push-to-talk**: hold a key while speaking, release to transcribe & insert.
-- **Always warm**: the Whisper model stays resident in RAM (systemd user
-  service), so transcription starts instantly (~3–4 s for a phrase on CPU).
-- **Global hotkey on Wayland**: the key is read straight from the kernel via
-  `evdev`, so it works regardless of the compositor and in any app.
-- **Clipboard-backed paste**: the dictated text is left in the clipboard, so if
-  the auto-paste misses (focus moved off the field) you can just Ctrl+V it.
-- **Clear feedback**: soft start/stop beeps + a single, self-replacing desktop
-  notification.
-- **Optional "polish" mode**: a second push-to-talk key rewrites the dictation
-  through a Claude model (fixes grammar/structure, an occasional emoji at most)
-  before pasting, with its own start chime — the normal key stays verbatim.
-- **Mic conditioning** (on by default, needs `ffmpeg`): the recording is
-  captured from the card's cleaner 48 kHz altset and run through a gentle
-  ffmpeg chain — high-pass, mild denoise, speech leveling (louder & clearer),
-  limiter — before transcription. It touches only the dictation buffer, never
-  the system mic, so calls and other apps are unaffected.
+- **Push-to-talk** — hold a key while speaking, release to transcribe and insert.
+- **A key per language** — Right Ctrl dictates Russian, another key English.
+  Naming the language beats detecting it: detection is a whole extra encoder pass
+  and it misreads short takes.
+- **Runs on the GPU** — whisper `large-v3` on the Intel Arc iGPU via OpenVINO,
+  **0.67 s** a take, with automatic fallback to faster-whisper on the CPU if the
+  GPU stack is missing.
+- **Never blocks** — releasing the key hands the take to a worker thread, so the
+  next thought can be recorded while the previous one is still being recognised.
+- **Global hotkey on Wayland** — keys are read straight from the kernel via
+  `evdev`, so it works in any app regardless of the compositor, and keyboards
+  plugged in later are picked up automatically.
+- **Clipboard-backed paste** — the text is left in the clipboard, so if the
+  auto-paste misses (focus moved off the field) you can just Ctrl+V it.
+- **Optional polish mode** — hold both dictation keys and the take is rewritten
+  through a Claude model before pasting; the single-key path stays verbatim.
+- **Mic conditioning** — the capture is cleaned through ffmpeg (high-pass, mild
+  denoise, speech levelling, limiter) before recognition, touching only the
+  dictation buffer and never the system mic.
+- **Your own vocabulary** — `VD_PROMPT` biases recognition toward the names and
+  jargon you actually use, within whisper's 223-token budget.
 
 ## ⚙️ How it works
 
 ```
 hold key ──▶ pw-record (48 kHz stereo WAV)
-release  ──▶ ffmpeg (high-pass · denoise · level · limiter → 16 kHz mono)
-         ──▶ faster-whisper (Russian, VAD) ──▶ text
+release  ──▶ worker thread ─ you can start the next take right away
+         ──▶ ffmpeg (high-pass · denoise · level · limiter → 16 kHz mono)
+         ──▶ Silero VAD ──▶ whisper large-v3 on the Arc iGPU ──▶ text
          ──▶ wl-copy + ydotool Ctrl+V ──▶ focused window (text kept in clipboard)
 ```
 
-- The key is captured with **evdev** (raw kernel input) and its real state is
-  read via `active_keys()` (`EVIOCGKEY`), so a missed press/release can never
-  leave recording stuck.
-- Text is inserted via **clipboard + `ydotool` Ctrl+V**. A real clipboard-free
-  Unicode "type" isn't possible on KWin (no `virtual_keyboard_manager_v1`, no
-  `input-method-v2`), so the text is left in the clipboard as a fallback: if the
-  auto-paste lands in the wrong place, just Ctrl+V it yourself.
-- Pick a **non-printing** PTT key (a modifier or a spare key). Keys are not
-  grabbed, so a letter key would leak into the focused app — `Right Ctrl` is the
-  sensible default (like Discord PTT).
+- Keys are captured with **evdev** (raw kernel input) and their real state is read
+  via `active_keys()` (`EVIOCGKEY`), so a missed press or release can never leave
+  recording stuck.
+- Text is inserted via **clipboard + `ydotool` Ctrl+V**. A clipboard-free Unicode
+  "type" isn't possible on KWin (no `virtual_keyboard_manager_v1`, no
+  `input-method-v2`), so the text stays in the clipboard as a fallback.
+- Pick a **non-printing** key. Keys are not grabbed, so a letter key would leak
+  into the focused app — `Right Ctrl` is the sensible default, like Discord PTT.
+
+### The keys
+
+| hold | what it does |
+|---|---|
+| `Right Ctrl` | dictate in `VOICE_DICTATE_LANG` (Russian by default) |
+| `VD_PTT_KEY_2` | dictate in `VD_PTT_LANG_2` (English by default) |
+| both together | polish — rewrite the take through Claude, language detected |
+
+Press ordering does not matter for the chord: recording starts on whichever key
+lands first and is re-labelled if the other joins, so nothing spoken is lost.
 
 There's also a legacy **toggle** variant (`voice-dictate.sh` +
 `transcribe_daemon.py`, press once to start / again to stop) bound to a KDE
 global shortcut — kept as a fallback.
-
-## ✨ Polish mode (optional)
-
-A second push-to-talk key rewrites the dictation before pasting — fixes grammar
-and punctuation, tidies rambling phrasing, and adds an occasional emoji at most —
-while the normal key still pastes the raw transcription. Great for chat and notes; keep
-the verbatim key for terminals, code, and search boxes.
-
-```
-hold polish key ──▶ pw-record ──▶ faster-whisper ──▶ Claude (rewrite) ──▶ paste
-```
-
-- Give it a **dedicated key** via `VD_POLISH_KEY` (a spare key held on its own —
-  a shared-key chord like Ctrl+Shift is fiddly because of press ordering).
-  Multiple keys are allowed (comma-separated), so each keyboard can use a key it
-  actually has.
-- The rewrite reuses the **Claude Code CLI's** OAuth token from
-  `~/.claude/.credentials.json` (so you need Claude Code installed and logged in)
-  — no separate API key. Model defaults to `claude-haiku-4-5` (fast, ~2 s).
-- If the token is stale it pastes the **raw** text and shows a hint, so a
-  dictation is never lost.
-- A distinct start chime (`polish_start.wav`) tells you which mode you're in.
-- The dictation is **edited, never obeyed**. This matters because polish is
-  perfect for composing prompts for some *other* assistant: dictate "write me a
-  function that parses JSON" and a naive setup returns the function. Three things
-  keep the editor in its role — the fragment arrives fenced in `<fragment>` tags,
-  the task is restated *after* it (rules that sit only in the system prompt lose
-  to an imperative arriving last), and the reply is prefilled with `<edited>` so
-  it cannot open with "I notice you asked…". Override `VD_POLISH_PROMPT` freely;
-  the fencing, the restated task, and the detected-language line are appended
-  around it either way.
-
-> Some keys (a laptop vendor key, the Menu/Compose key) fire an OS action or
-> emit a modifier combo. If that gets in the way, remap the physical key to an
-> inert one (e.g. `F24`) with a udev `hwdb` rule and point `VD_POLISH_KEY` at it.
-
-## ⏱️ Latency
-
-Releasing the key never blocks: the take goes to a worker thread and you can
-start the next one immediately, so a thought that arrives mid-transcription is
-no longer lost. Takes are recognised in the order spoken and each is pasted the
-moment it is ready, between presses — never into a recording that is already
-running.
-
-That hides the wait but doesn't shorten it, and on CPU the wait is mostly
-**fixed**: whisper always encodes a padded 30-second window, so a 2-second take
-costs nearly as much as a 20-second one. Two things follow.
-
-`large-v3-turbo` is the wrong instinct for short dictation. Turbo shrinks the
-*decoder*; its encoder is the full large-v3 one, and the encoder is what a short
-take pays for. Measured on a Core Ultra 7 255H, 2-second take / 20-second take:
-
-| model | 2s take | 20s take |
-|---|---|---|
-| `small` | 1.25 s | 2.20 s |
-| `medium` | 3.19 s | 5.18 s |
-| `large-v3-turbo` | 5.12 s | 5.93 s |
-
-And more threads is not more speed on a hybrid CPU: ctranslate2 splits each
-layer evenly, so P-cores idle while E-cores finish. 16 threads measured *slower*
-than 8. Hence the `min(8, cores)` default.
-
-Whisper also competes with whatever else is running — a busy browser can triple
-these numbers. There is no CUDA path on Intel Arc, so `int8` on CPU is the
-ceiling here; beam size, `initial_prompt` and the VAD filter all measured within
-noise and are not worth tuning for speed.
-
-## 🎚️ Mic conditioning (optional, on by default)
-
-Cheap USB mics are quiet and noisy. But route dictation through the *system*
-default source (an EasyEffects/RNNoise chain) and you'll fight its VAD gate,
-which clips word starts and tanks accuracy. So the cleanup is done **in-process
-on the recorded buffer** instead — the system mic stays raw and calls/other apps
-are untouched.
-
-On key release the recording is passed through one `ffmpeg` filter chain:
-
-```
-highpass=f=90        → cut sub-90 Hz rumble & handling noise
-afftdn=nr=12:nf=-25  → gentle FFT denoise (≈no-op in a quiet room, helps when noisy)
-speechnorm=…         → raise the level (the "louder & clearer" win), capped so
-                       silence/pauses are NOT amplified into loud hiss
-alimiter=…           → catch peaks so nothing clips
-                     → resampled to whisper's 16 kHz mono
-```
-
-It's all best-effort: if `ffmpeg` is missing, the chain errors, or you set
-`VD_CLEAN=0`, dictation falls back to the plain raw 16 kHz capture — nothing is
-ever lost. Tune or replace the chain with `VD_CLEAN_FILTER` (e.g. swap `afftdn`
-for `arnndn=m=/path/to/model.rnnn` to use the RNNoise **AI** denoiser once you
-have a `.rnnn` model).
 
 ## 📦 Requirements
 
@@ -154,6 +95,9 @@ have a `.rnnn` model).
 - `wl-clipboard` (`wl-copy`)
 - `libnotify` (`notify-send`), `pulseaudio-utils`/`pipewire` (`paplay`)
 - Read access to `/dev/input/event*` (be in the `input` group)
+- **For the GPU backend** (optional, and the default when present): Intel compute
+  runtime + OpenVINO — `sudo ./install-openvino.sh` sets it all up. Without it the
+  daemon falls back to faster-whisper on the CPU by itself.
 
 ## 🚀 Install
 
@@ -196,6 +140,171 @@ The first line of the model log confirms it's ready:
 journalctl --user -u voice-ptt -f
 ```
 
+## ⚡ Running on the Intel Arc iGPU
+
+Recognition runs on the integrated GPU through OpenVINO by default, and falls
+back to faster-whisper on the CPU by itself if the runtime, the model or the
+device is missing — a broken GPU setup degrades to slower dictation, never to no
+dictation. `sudo ./install-openvino.sh` installs everything needed.
+
+Measured over 376 real takes on a Core Ultra 7 255H:
+
+| backend | model | per take |
+|---|---|---|
+| faster-whisper, CPU, beam 5 | `medium` | 3.80 s |
+| **OpenVINO, Arc iGPU, greedy** | **`large-v3`** | **0.67 s** |
+
+The interesting part is that this is not a speed-for-accuracy trade. OpenVINO
+cannot do beam search on the GPU, which sounds like a quality loss — but the
+speedup is large enough to afford a *bigger model*, and `large-v3` greedy beats
+`medium` beam-5 comfortably: `paper trading` instead of "PEPPER трейдинг",
+"Внеси" instead of "Неси", `РФ` instead of `RF`. On the GPU `large-v3` costs
+about what `medium` does (0.67 s vs 0.51 s), because both are dominated by
+whisper's fixed 30-second window rather than by model size. So the model-size
+trade-off that matters so much on CPU simply stops applying.
+
+Two things to know:
+
+- **Non-speech takes.** faster-whisper runs Silero VAD internally; OpenVINO does
+  not, and handed a dead capture or a key knock, whisper invents a subtitle
+  credit ("Subtitles by the Amara.org community") which then gets pasted. The
+  OpenVINO path therefore runs the same VAD first, backed by an RMS gate
+  (`VD_SILENCE_RMS`) and a filter for whisper's stock hallucinations.
+- **`VD_PROMPT` on smaller models.** With `medium`, an `initial_prompt` would
+  occasionally collapse a long take to a fragment — reliably on CPU, at random on
+  GPU, and `hotwords` was worse still. `large-v3` does not do this (0 of 13 long
+  takes), so the prompt stays on. Worth remembering if you switch models.
+
+Set `VD_OV_DEVICE=NPU` to try the neural engine instead; that needs membership of
+the `render` group, which `install-openvino.sh` arranges, and a fresh login.
+
+## ⏱️ Latency
+
+Releasing the key never blocks: the take goes to a worker thread and you can
+start the next one immediately, so a thought that arrives mid-transcription is
+no longer lost. Takes are recognised in the order spoken and each is pasted the
+moment it is ready, between presses — never into a recording that is already
+running.
+
+That hides the wait but doesn't shorten it, and on CPU the wait is mostly
+**fixed**: whisper always encodes a padded 30-second window, so a 2-second take
+costs nearly as much as a 20-second one. Two things follow.
+
+`large-v3-turbo` is the wrong instinct for short dictation. Turbo shrinks the
+*decoder*; its encoder is the full large-v3 one, and the encoder is what a short
+take pays for. Measured on a Core Ultra 7 255H, 2-second take / 20-second take:
+
+| model | 2s take | 20s take |
+|---|---|---|
+| `small` | 1.25 s | 2.20 s |
+| `medium` | 3.19 s | 5.18 s |
+| `large-v3-turbo` | 5.12 s | 5.93 s |
+
+And more threads is not more speed on a hybrid CPU: ctranslate2 splits each
+layer evenly, so P-cores idle while E-cores finish. 16 threads measured *slower*
+than 8. Hence the `min(8, cores)` default.
+
+Whisper also competes with whatever else is running — a busy browser can triple
+these numbers. Within the CPU engine that is close to the floor: beam size,
+`initial_prompt` and the VAD filter all measured within noise, and batching long
+takes turned out to be a GPU optimisation with nothing to gain on a CPU whose
+threads are already saturated. Getting past it needed different silicon, which is
+what the [Arc iGPU backend](#-running-on-the-intel-arc-igpu) is.
+
+## 🔬 Choosing a model on evidence
+
+Model size is a real trade-off — a smaller one is dramatically faster and gets
+more wrong — and it is impossible to judge from a couple of samples. Two tools:
+
+- `./compare-models.sh` scores **one** freshly dictated reference phrase against
+  a list of expected terms. Good for a quick vocabulary check.
+- `./compare-takes.py` replays **everything you have actually dictated** through
+  several models and prints only the takes where they disagree. Where they agree
+  the audio was clear and the choice did not matter.
+
+For the second one, point `VD_KEEP_DIR` at a directory and dictate normally for
+a few days; each take is archived as the conditioned 16 kHz copy whisper saw,
+next to a `.txt` of what it heard. Then:
+
+```bash
+./compare-takes.py                                  # all of it, small/medium/turbo
+./compare-takes.py --models small,medium --limit 40 # the newest 40 takes
+```
+
+It reads `VD_PROMPT` from the running unit and the language from each take's
+filename, so the replay matches what the daemon really does.
+
+This is worth the trouble because intuition is wrong here often enough to matter.
+Replaying 66 real takes is what showed that `large-v3-turbo`, the largest model,
+is **not** the accuracy answer: it wins on proper nouns and foreign words but
+loses on plain Russian, breaking takes that `small` got right. It also killed
+three plausible speed ideas that measured as noise, including batching long
+takes — a GPU optimisation with nothing to gain on a thread-saturated CPU.
+
+> Both `VD_KEEP_DIR` and `VD_LOG_TEXT` are off by default and should stay off
+> outside such an experiment: one writes recordings of everything you say to
+> disk, the other puts every dictation in the system journal.
+
+## ✨ Polish mode (optional)
+
+A second push-to-talk key rewrites the dictation before pasting — fixes grammar
+and punctuation, tidies rambling phrasing, and adds an occasional emoji at most —
+while the normal key still pastes the raw transcription. Great for chat and notes; keep
+the verbatim key for terminals, code, and search boxes.
+
+```
+hold polish key ──▶ pw-record ──▶ faster-whisper ──▶ Claude (rewrite) ──▶ paste
+```
+
+- Give it a **dedicated key** via `VD_POLISH_KEY` (a spare key held on its own —
+  a shared-key chord like Ctrl+Shift is fiddly because of press ordering).
+  Multiple keys are allowed (comma-separated), so each keyboard can use a key it
+  actually has.
+- The rewrite reuses the **Claude Code CLI's** OAuth token from
+  `~/.claude/.credentials.json` (so you need Claude Code installed and logged in)
+  — no separate API key. Model defaults to `claude-haiku-4-5` (fast, ~2 s).
+- If the token is stale it pastes the **raw** text and shows a hint, so a
+  dictation is never lost.
+- A distinct start chime (`polish_start.wav`) tells you which mode you're in.
+- The dictation is **edited, never obeyed**. This matters because polish is
+  perfect for composing prompts for some *other* assistant: dictate "write me a
+  function that parses JSON" and a naive setup returns the function. Three things
+  keep the editor in its role — the fragment arrives fenced in `<fragment>` tags,
+  the task is restated *after* it (rules that sit only in the system prompt lose
+  to an imperative arriving last), and the reply is prefilled with `<edited>` so
+  it cannot open with "I notice you asked…". Override `VD_POLISH_PROMPT` freely;
+  the fencing, the restated task, and the detected-language line are appended
+  around it either way.
+
+> Some keys (a laptop vendor key, the Menu/Compose key) fire an OS action or
+> emit a modifier combo. If that gets in the way, remap the physical key to an
+> inert one (e.g. `F24`) with a udev `hwdb` rule and point `VD_POLISH_KEY` at it.
+
+## 🎚️ Mic conditioning (optional, on by default)
+
+Cheap USB mics are quiet and noisy. But route dictation through the *system*
+default source (an EasyEffects/RNNoise chain) and you'll fight its VAD gate,
+which clips word starts and tanks accuracy. So the cleanup is done **in-process
+on the recorded buffer** instead — the system mic stays raw and calls/other apps
+are untouched.
+
+On key release the recording is passed through one `ffmpeg` filter chain:
+
+```
+highpass=f=90        → cut sub-90 Hz rumble & handling noise
+afftdn=nr=12:nf=-25  → gentle FFT denoise (≈no-op in a quiet room, helps when noisy)
+speechnorm=…         → raise the level (the "louder & clearer" win), capped so
+                       silence/pauses are NOT amplified into loud hiss
+alimiter=…           → catch peaks so nothing clips
+                     → resampled to whisper's 16 kHz mono
+```
+
+It's all best-effort: if `ffmpeg` is missing, the chain errors, or you set
+`VD_CLEAN=0`, dictation falls back to the plain raw 16 kHz capture — nothing is
+ever lost. Tune or replace the chain with `VD_CLEAN_FILTER` (e.g. swap `afftdn`
+for `arnndn=m=/path/to/model.rnnn` to use the RNNoise **AI** denoiser once you
+have a `.rnnn` model).
+
 ## 🔧 Configuration
 
 Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
@@ -206,13 +315,19 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VD_PTT_MOD` | *(empty)* | optional modifier(s), comma-separated; empty = single-key hold |
 | `VD_PTT_KEY_2` | *(empty)* | second dictation key, bound to its own language; empty = off |
 | `VD_PTT_LANG_2` | `en` | language for that second key |
-| `VOICE_DICTATE_MODEL` | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | model id / size / path |
+| `VOICE_DICTATE_BACKEND` | `openvino` | `openvino` (Arc iGPU) or `faster-whisper` (CPU). Falls back to the CPU engine on its own if OpenVINO can't start |
+| `VD_OV_MODEL` | `~/.local/share/voice-dictate/models/whisper-large-v3-int8-ov` | OpenVINO IR model directory |
+| `VD_OV_DEVICE` | `GPU` | OpenVINO device: `GPU`, `NPU` or `CPU` |
+| `VD_SILENCE_RMS` | `0.002` | skip takes quieter than this instead of letting whisper invent subtitle credits for them |
+| `VOICE_DICTATE_MODEL` | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | model for the **CPU fallback** |
 | `VOICE_DICTATE_LANG` | `ru` | language code, or `auto` to detect per press — see below |
 | `VOICE_DICTATE_COMPUTE` | `int8` | ctranslate2 compute type |
 | `VOICE_DICTATE_THREADS` | `min(8, cores)` | CPU threads; capped because hybrid P/E-core CPUs get *slower* with all of them |
 | `VD_PASTE_KEYS` | `29:1 47:1 47:0 29:0` | ydotool codes for paste (Ctrl+V); for terminals use Ctrl+Shift+V: `29:1 42:1 47:1 47:0 42:0 29:0` |
 | `VD_MIN_MS` | `250` | ignore presses shorter than this |
 | `VD_RESCAN_SEC` | `2` | how often to look for keyboards plugged in after startup |
+| `VD_LOG_TEXT` | `0` | log the recognised text, not just its length — off by default, since it puts every dictation in the journal |
+| `VD_KEEP_DIR` | *(empty)* | archive each take's audio + transcript here, for replaying through another model — off by default, since it records everything you say |
 | `VD_MAX_SEC` | `180` | safety cap on a single recording |
 | `VD_PROMPT` | *(empty)* | `initial_prompt` to bias recognition toward your vocabulary (names, jargon, tickers). **Max 223 tokens** — see below |
 | `VD_BEAM` | `5` | decoding beam size; `1` = greedy (faster, slightly less accurate) |
