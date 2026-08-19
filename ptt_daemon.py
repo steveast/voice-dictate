@@ -18,8 +18,17 @@ The keys are NOT grabbed, so they still pass through to apps. With a modifier
 configured, the main key alone (plain "x") is left completely untouched.
 
 Config via env:
-  VOICE_DICTATE_MODEL    faster-whisper model id/size/path
-                         (default: cached large-v3-turbo)
+  VOICE_DICTATE_BACKEND  "openvino" (whisper on the Intel Arc iGPU) or
+                         "faster-whisper" (CPU). OpenVINO falls back to the CPU
+                         engine by itself if it cannot start (default: openvino)
+  VD_OV_MODEL            OpenVINO IR model directory
+                         (default: ~/.local/share/voice-dictate/models/
+                          whisper-large-v3-int8-ov)
+  VD_OV_DEVICE           OpenVINO device: GPU, NPU, CPU     (default: GPU)
+  VD_SILENCE_RMS         skip takes quieter than this rather than let whisper
+                         invent subtitle credits for them   (default: 0.002)
+  VOICE_DICTATE_MODEL    faster-whisper model id/size/path, used by the CPU
+                         fallback          (default: cached large-v3-turbo)
   VOICE_DICTATE_LANG     language code, or "auto" to detect
                          the language on every press       (default: ru)
   VOICE_DICTATE_COMPUTE  ctranslate2 compute type          (default: int8)
@@ -36,6 +45,9 @@ Config via env:
   VD_MIN_MS             ignore presses shorter than this   (default: 250)
   VD_RESCAN_SEC         how often to look for keyboards
                         plugged in after startup           (default: 2)
+  VD_LOG_TEXT           log the recognised text, not just its
+                        length; off by default because it puts
+                        every dictation in the journal     (default: 0)
   VD_PROMPT             initial_prompt to bias recognition toward your own
                         vocabulary (names, jargon, tickers)      (default: none)
                         Hard limit 223 tokens: whisper keeps only the tail of a
@@ -103,6 +115,7 @@ import time
 import wave
 import json
 import queue
+import shutil
 import signal
 import threading
 import selectors
@@ -134,6 +147,35 @@ MODEL = os.environ.get("VOICE_DICTATE_MODEL",
                        "mobiuslabsgmbh/faster-whisper-large-v3-turbo")
 LANG = os.environ.get("VOICE_DICTATE_LANG", "ru")
 COMPUTE = os.environ.get("VOICE_DICTATE_COMPUTE", "int8")
+# Which engine does the recognising. "openvino" runs whisper on the Intel Arc
+# iGPU through OpenVINO; "faster-whisper" is the CPU engine this started on and
+# stays the fallback, used automatically whenever OpenVINO cannot be brought up
+# (missing runtime, missing model, no such device). Measured on this machine,
+# a take went from 3.80s on CPU medium to 0.67s on GPU large-v3 — and the larger
+# model is also the more accurate one, so there is no trade being made here.
+BACKEND = os.environ.get("VOICE_DICTATE_BACKEND", "openvino").strip().lower()
+# The GPU is fast enough that large-v3 costs about what medium does (0.67s vs
+# 0.51s): both are dominated by whisper's fixed 30s window rather than by model
+# size, so there is no reason to run a smaller one here.
+OV_MODEL = os.path.expanduser(os.environ.get(
+    "VD_OV_MODEL", "~/.local/share/voice-dictate/models/whisper-large-v3-int8-ov"))
+OV_DEVICE = os.environ.get("VD_OV_DEVICE", "GPU").strip()
+# Whisper invents text when handed something that is not speech, and it invents
+# the *same* few phrases — they come from subtitle files in its training data.
+# Two guards, because the observed cases split evenly between two causes:
+# digital silence (a capture that produced nothing) and a short loud thump (the
+# key itself). The RMS gate catches the first; the phrase list catches the rest.
+# Measured against 60 real takes, the gate had no false positives — the quietest
+# genuine dictation sat an order of magnitude above it.
+SILENCE_RMS = float(os.environ.get("VD_SILENCE_RMS", "0.002"))
+JUNK_OUTPUTS = (
+    "subtitles by the amara.org community",
+    "редактор субтитров а.синецкая корректор а.егорова",
+    "субтитры сделал dimatorzok",
+    "продолжение следует...",
+    "спасибо за просмотр!",
+    "подписывайтесь на канал",
+)
 # Capped rather than "every core". Modern hybrid CPUs mix fast P-cores with
 # slow E-cores, and ctranslate2 splits each layer evenly across whatever it is
 # given — so the P-cores sit waiting on the E-cores and the whole take runs at
@@ -158,6 +200,15 @@ MAX_REC = float(os.environ.get("VD_MAX_SEC", "180"))
 # How often to look for keyboards plugged in after startup. Cheap: a directory
 # listing, and an open() only for event nodes never seen before.
 RESCAN_SEC = float(os.environ.get("VD_RESCAN_SEC", "2"))
+# Log the recognised text, not just its length. Off by default on purpose: this
+# is everything you dictate, and the journal is not the place for it without
+# asking. Turn it on to judge a model change on real takes instead of guesses.
+LOG_TEXT = os.environ.get("VD_LOG_TEXT", "").strip().lower() in ("1", "true", "yes")
+# Archive each take's audio next to what was heard. Off by default, and for the
+# same reason as VD_LOG_TEXT only more so — this keeps recordings of everything
+# you say. Worth turning on for a while when choosing a model: it is the only
+# way to replay real dictation through a different one instead of guessing.
+KEEP_DIR = os.path.expanduser(os.environ.get("VD_KEEP_DIR", "").strip())
 # Bias recognition toward a custom vocabulary (names, jargon, tickers).
 PROMPT = os.environ.get("VD_PROMPT", "").strip() or None
 # Decoding beam width; 1 = greedy decode (faster, marginally less accurate).
@@ -368,25 +419,114 @@ def pretty_combo(mod_codes, main_code):
     return "+".join(parts)
 
 
-def warn_if_prompt_truncated(model):
+class FasterWhisperBackend:
+    """The original CPU engine. Still the fallback, and still the only one of the
+    two that can do beam search."""
+
+    name = "faster-whisper"
+
+    def __init__(self):
+        from faster_whisper import WhisperModel
+        log(f"loading {MODEL} on CPU (compute={COMPUTE}, threads={THREADS}) ...")
+        self.model = WhisperModel(MODEL, device="cpu", compute_type=COMPUTE,
+                                  cpu_threads=THREADS)
+
+    def transcribe(self, audio, lang):
+        segments, info = self.model.transcribe(audio, language=lang,
+                                               beam_size=BEAM, vad_filter=True,
+                                               initial_prompt=PROMPT)
+        return "".join(s.text for s in segments).strip(), info.language
+
+    def prompt_budget(self):
+        """(token ids, budget) for the VD_PROMPT length warning."""
+        ids = self.model.hf_tokenizer.encode(" " + PROMPT,
+                                             add_special_tokens=False).ids
+        return ids, self.model.max_length // 2 - 1, self.model.hf_tokenizer.decode
+
+
+class OpenVinoBackend:
+    """Whisper on the Intel Arc iGPU. No beam search — OpenVINO raises "Not
+    Implemented" for it on GPU — but greedy on a larger model beats beam search
+    on a smaller one, which is the whole reason this is worth having."""
+
+    name = "openvino"
+
+    def __init__(self):
+        import openvino_genai
+        global get_speech_timestamps
+        from faster_whisper.vad import get_speech_timestamps
+        if not os.path.isdir(OV_MODEL):
+            raise FileNotFoundError(f"no OpenVINO model at {OV_MODEL}")
+        log(f"loading {os.path.basename(OV_MODEL)} on {OV_DEVICE} ...")
+        t0 = time.time()
+        self.pipe = openvino_genai.WhisperPipeline(OV_MODEL, OV_DEVICE)
+        # Kernels are compiled on first load; that cost is paid here, at startup,
+        # not on the first dictation.
+        log(f"  {OV_DEVICE} pipeline ready in {time.time() - t0:.1f}s")
+
+    def transcribe(self, audio, lang):
+        # faster-whisper runs Silero VAD itself (vad_filter=True); OpenVINO does
+        # not, and without it a key knock or a dead capture is handed to whisper
+        # as if it were speech — which is exactly when whisper invents subtitle
+        # credits. Same VAD, same effect: no speech in, nothing out.
+        if not get_speech_timestamps(audio):
+            log("no speech in take (VAD), skipped")
+            return "", lang
+        cfg = self.pipe.get_generation_config()
+        cfg.task = "transcribe"
+        if lang:
+            cfg.language = f"<|{lang}|>"
+        if PROMPT:
+            cfg.initial_prompt = PROMPT
+        # genai wants a plain list of floats; a numpy array goes down a slower
+        # path inside the binding.
+        res = self.pipe.generate(audio.tolist(), cfg)
+        return str(res).strip(), (getattr(res, "language", None) or lang)
+
+    def prompt_budget(self):
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(os.path.join(OV_MODEL, "tokenizer.json"))
+        # Same architecture, same 448-token context, so the same 223 budget.
+        return tok.encode(" " + PROMPT).ids, 223, tok.decode
+
+
+def build_backend():
+    """The configured engine, or the CPU one if it cannot be brought up. A
+    missing GPU runtime must degrade to working dictation, never to no daemon."""
+    if BACKEND in ("openvino", "ov"):
+        try:
+            return OpenVinoBackend()
+        except Exception as e:  # noqa: BLE001 — any failure means fall back
+            log("openvino unavailable, falling back to faster-whisper:", repr(e))
+            notify("⚠️ OpenVINO недоступен, работаю на CPU", 5000)
+    elif BACKEND not in ("faster-whisper", "faster_whisper", "cpu"):
+        log(f"unknown VOICE_DICTATE_BACKEND={BACKEND!r}, using faster-whisper")
+    return FasterWhisperBackend()
+
+
+def looks_like_junk(text):
+    """Whisper's stock hallucinations, matched whole so a real dictation that
+    merely mentions one of these phrases is not thrown away."""
+    stripped = " ".join(text.lower().replace("ё", "е").split()).strip(" .!?")
+    return any(stripped == j.strip(" .!?") for j in JUNK_OUTPUTS)
+
+
+def warn_if_prompt_truncated(backend):
     """Whisper only has room for `max_length // 2 - 1` (=223) prompt tokens, and
-    faster-whisper silently keeps the *tail* of a longer initial_prompt — the
+    silently keeps the *tail* of a longer initial_prompt — the
     vocabulary at the front is dropped with no error and no log line. That looks
     exactly like the model simply mishearing those words, so say it out loud."""
     if not PROMPT:
         return
-    budget = model.max_length // 2 - 1
     try:
-        # add_special_tokens=False mirrors faster-whisper's own Tokenizer.encode,
-        # so the count matches what transcribe() will actually budget.
-        ids = model.hf_tokenizer.encode(" " + PROMPT, add_special_tokens=False).ids
+        ids, budget, decode = backend.prompt_budget()
     except Exception as e:  # noqa: BLE001 - never let a warning break startup
         log("prompt length check skipped:", repr(e))
         return
     if len(ids) <= budget:
         log(f"VD_PROMPT: {len(ids)}/{budget} tokens")
         return
-    dropped = model.hf_tokenizer.decode(ids[:len(ids) - budget])
+    dropped = decode(ids[:len(ids) - budget])
     log(f"VD_PROMPT too long: {len(ids)}/{budget} tokens — whisper keeps only "
         f"the last {budget}. Silently dropped from the front: {dropped!r}")
     notify(f"⚠️ VD_PROMPT длиннее лимита: {len(ids)}/{budget} токенов, "
@@ -475,8 +615,8 @@ class Take:
 
 
 class Dictation:
-    def __init__(self, model, recorder):
-        self.model = model
+    def __init__(self, backend, recorder):
+        self.backend = backend
         self.recorder = recorder
         self.proc = None
         self.t0 = 0.0
@@ -557,6 +697,25 @@ class Dictation:
                 pass
 
     @staticmethod
+    def archive(take, text):
+        """Keep a copy of the audio and what was heard, so a model can be judged
+        by replaying real takes. The conditioned 16 kHz mono copy is the one
+        whisper actually saw, so that is what gets kept."""
+        if not KEEP_DIR:
+            return
+        try:
+            os.makedirs(KEEP_DIR, exist_ok=True)
+            src = take.clean if os.path.exists(take.clean) else take.wav
+            base = os.path.join(
+                KEEP_DIR,
+                f"{time.strftime('%Y%m%d-%H%M%S')}-{take.seq:04d}-{take.lang}")
+            shutil.copyfile(src, base + ".wav")
+            with open(base + ".txt", "w") as f:
+                f.write(text)
+        except OSError as e:  # noqa: BLE001 — archiving must never break a take
+            log("archive failed:", repr(e))
+
+    @staticmethod
     def retire(take):
         """Fold a finished take's audio back onto the fixed ptt.wav names. This
         is the cleanup for the numbered files (they must not pile up) and it
@@ -579,18 +738,31 @@ class Dictation:
             src = take.clean
         try:
             audio = load_wav(src)
+            # Silence in, hallucination out: handed a take with no speech in it,
+            # whisper invents a subtitle credit and it gets pasted. Cheaper and
+            # more reliable to notice the silence than to filter the invention.
+            rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64)))) \
+                if audio.size else 0.0
+            if rms < SILENCE_RMS:
+                log(f"take is silent (rms {rms:.5f} < {SILENCE_RMS}), skipped")
+                notify("🔇 Тишина", 2000)
+                return "", None
             lang = None if take.lang == "auto" else take.lang
             t1 = time.time()
-            segments, info = self.model.transcribe(audio, language=lang,
-                                                   beam_size=BEAM, vad_filter=True,
-                                                   initial_prompt=PROMPT)
-            text = "".join(s.text for s in segments).strip()
+            text, heard_lang = self.backend.transcribe(audio, lang)
             log(f"transcribed {audio.size / 16000:.1f}s in {time.time() - t1:.1f}s "
-                f"-> {len(text)} chars, lang={info.language} "
-                f"p={info.language_probability:.2f}")
+                f"-> {len(text)} chars, lang={heard_lang}")
+            if LOG_TEXT:
+                log(f"  heard: {text!r}")
+            if text and looks_like_junk(text):
+                # The loud-thump case the RMS gate cannot see: a key knock is not
+                # silent, but it is not speech either.
+                log(f"dropped stock hallucination: {text!r}")
+                notify("🤷 Не речь", 2000)
+                return "", None
             if not text:
                 notify("🤷 Ничего не распознано", 2000)
-            return text, info.language
+            return text, heard_lang
         except Exception as e:  # noqa: BLE001
             log("transcribe error:", repr(e))
             notify("❌ Ошибка распознавания", 3000)
@@ -715,12 +887,9 @@ def main():
             + "; check /dev/input permissions")
         sys.exit(1)
 
-    from faster_whisper import WhisperModel
-    log(f"loading model {MODEL} (compute={COMPUTE}, threads={THREADS}) ...")
     t0 = time.time()
-    model = WhisperModel(MODEL, device="cpu", compute_type=COMPUTE,
-                         cpu_threads=THREADS)
-    warn_if_prompt_truncated(model)
+    backend = build_backend()
+    warn_if_prompt_truncated(backend)
     bindings = [f"{combo} -> {LANG}"]
     if lang2_codes:
         bindings.append(f"{lang2_combo} -> {PTT_LANG_2}")
@@ -728,13 +897,14 @@ def main():
         bindings.append(f"{combo}+{lang2_combo} -> polish ({POLISH_LANG})")
     if polish_enabled:
         bindings.append(f"{polish_combo} -> polish ({POLISH_LANG})")
-    log(f"model ready in {time.time() - t0:.1f}s; " + ", ".join(bindings))
+    log(f"{backend.name} ready in {time.time() - t0:.1f}s; "
+        + ", ".join(bindings))
     notify(f"🚀 Готово: {combo} — {LANG}"
            + (f", {lang2_combo} — {PTT_LANG_2}" if lang2_codes else "")
            + (f", вместе — причесать ✨" if chord_polish else "")
            + (f", {polish_combo} — причесать ✨" if polish_enabled else ""), 5000)
 
-    dictation = Dictation(model, recorder)
+    dictation = Dictation(backend, recorder)
     sel = selectors.DefaultSelector()
     for d in devs:
         sel.register(d, selectors.EVENT_READ)
@@ -771,6 +941,9 @@ def main():
                 polished, err = polish_text(text, lang)
                 if polished:
                     text, err = polished, None
+                    if LOG_TEXT:
+                        log(f"  polished: {text!r}")
+            dictation.archive(take, text)
             dictation.retire(take)
             results.put((text, err))
             os.write(wake_w, b"x")
