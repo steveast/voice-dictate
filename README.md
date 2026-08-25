@@ -280,6 +280,50 @@ hold polish key ──▶ pw-record ──▶ faster-whisper ──▶ Claude (r
 > emit a modifier combo. If that gets in the way, remap the physical key to an
 > inert one (e.g. `F24`) with a udev `hwdb` rule and point `VD_POLISH_KEY` at it.
 
+## 🎤 Which mic (name it, don't inherit it)
+
+By default the daemon records from the *system default source*, and that default
+is not yours to control: connect a Bluetooth headset and PipeWire moves it to the
+headset's HFP mic; disconnect one and it lands on the laptop array. Neither move
+announces itself, and whisper never reports damaged audio — it returns confident
+nonsense instead, which reads like the model got worse.
+
+Both ends of that swap were measured on the same box, against the 33–35 dB
+speech-band SNR that every well-recognised take in a 1600-take archive was
+recorded at:
+
+| | Buds 6 over HFP | built-in array |
+|---|---|---|
+| speech-band SNR | close-talk | **5.9 dB** |
+| exact-zero samples in a take | **44.8 %** (22 gate closures in 8.7 s) | 1.2 % |
+| bandwidth | brick wall at 7.5 kHz | full band |
+| a take | `…теперь микрофон работает. Не очень.` (~80 % right) | `Продюсер, продюсер, продюсер.` (said: *проверка*) |
+
+Two different ruins. The headset is a 16 kHz call link with call-grade noise
+suppression that *gates* — nearly half the take replaced by digital zeros, word
+onsets among them, and the gate lives inside the headset where no filter of ours
+can reach it. The laptop array is clean and wideband and a metre away from the
+mouth, so broadband room/fan noise sits ~6 dB under the voice. Four filter chains
+were tried on the same raw far-field take (gentler, stronger, high-passed at 150
+and 180 Hz); all four returned garbage. **A mic at the mouth with a bad codec
+beats a good mic across the room** — post-processing does not close a 30 dB gap.
+
+So name the mics, best first, and let each take use the first one that is
+actually there:
+
+```ini
+Environment=VD_SOURCE=bluez_input.C4:60:0A:A4:1D:64,alsa_input.pci-…HiFi__Mic1__source
+```
+
+`pactl list short sources` prints the names. The pin becomes `pw-record --target`
+(or `parecord --device` / `arecord -D`). Falling through the list is the point: a
+headset that goes flat mid-session costs one take, not the session — and if none
+of the named mics is present, the take still happens on the system default,
+because a lost take cannot be dictated again. The list of what exists is refreshed
+on the idle tick, never on the key press, so resolving the mic cannot clip a word
+(`VD_SOURCE_POLL_SEC`, default 10 s). The daemon logs the list at startup and one
+line whenever the mic in use changes. `./test_ptt_daemon.py` covers all of it.
+
 ## 🎚️ Mic conditioning (optional, on by default)
 
 Cheap USB mics are quiet and noisy. But route dictation through the *system*
@@ -396,6 +440,8 @@ keep in mind the daemon appends the language directive after it.
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `VD_SOURCE` | *(empty)* | capture device(s), best first — PipeWire/Pulse node names (`pactl list short sources`) or an ALSA device for `arecord`, comma/space separated. Each take uses the first one present. Empty = the system default, which a connected Bluetooth headset takes over |
+| `VD_SOURCE_POLL_SEC` | `10` | how often the list of present sources is re-read (on the idle tick, never on the key press) |
 | `VD_CLEAN` | `1` | master switch; `0` (or no `ffmpeg`) = raw 16 kHz capture, no post-processing |
 | `VD_REC_RATE` | `48000` | capture sample rate for the conditioned path (the card's cleaner altset) |
 | `VD_REC_CH` | `2` | capture channels for the conditioned path |
@@ -424,6 +470,9 @@ keep in mind the daemon appends the language directive after it.
   daemon rescans `/dev/input` every `VD_RESCAN_SEC` and logs `keyboard plugged
   in: …`. If that line never appears, the new node isn't readable — check the
   install step 1 permissions, which udev applies per device.
+- **Recognition got worse after connecting a headset** → it took the default
+  source with it. Pin the mic with `VD_SOURCE` (see [Which mic](#-which-mic-name-it-dont-inherit-it));
+  the startup log line `mic: …` says which one is in use.
 - **Cold start ~35 s once** → first model load; it stays warm afterwards.
 
 ## 📄 License

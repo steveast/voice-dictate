@@ -63,6 +63,18 @@ Config via env:
 Mic conditioning (needs ffmpeg; cleans/levels the recording in-process before
 transcription — the system default mic is left raw, so calls/other apps are
 untouched):
+  VD_SOURCE             capture device(s) to record from, best first —
+                        PipeWire/Pulse node names (pw-record --target, parecord
+                        --device) or an ALSA device for arecord; comma- or
+                        space-separated. Each take uses the first one that is
+                        actually present, so a headset going flat costs one take
+                        rather than the session. Empty = whatever the system
+                        default source happens to be, which is how a connected
+                        Bluetooth headset silently takes dictation over.
+                                                                  (default: empty)
+  VD_SOURCE_POLL_SEC    how often the list of present capture sources is
+                        re-read (it is read on the idle tick, never on the key
+                        press)                                     (default: 10)
   VD_CLEAN              1/0 master switch. Off (or no ffmpeg) = the old plain
                         16 kHz/mono capture, no post-processing   (default: 1)
   VD_REC_RATE           capture sample rate for the conditioned path; this card
@@ -110,6 +122,7 @@ so if the auto-paste misses — e.g. focus moved away from the field — you can
 Ctrl+V it in yourself.
 """
 import os
+import re
 import sys
 import time
 import wave
@@ -232,6 +245,24 @@ CLEAN = os.environ.get("VD_CLEAN", "1").strip().lower() not in ("0", "false", "n
 # 16 kHz on this hardware. Ignored when conditioning is off.
 REC_RATE = os.environ.get("VD_REC_RATE", "48000")
 REC_CH = os.environ.get("VD_REC_CH", "2")
+# Which mic to record from. Empty means the system default source, which sounds
+# reasonable and is a trap: connect a Bluetooth headset and PipeWire moves the
+# default to its HFP mic, so dictation quietly starts arriving through a 16 kHz
+# link with the headset's call-grade noise suppression in front of it. Measured
+# on Xiaomi Buds 6 (mSBC): a brick wall at 7.5 kHz and 45% of a take replaced by
+# exact digital zeros, 22 gate closures in 8.7 s — word onsets eaten, and whisper
+# guesses at what is left ("парсится" -> "пасется") or invents a whole sentence.
+# The gate lives in the headset, ahead of us, so no filter chain here can undo
+# it. Naming the mic keeps dictation on the built-in array no matter what the
+# desktop does with the default, and leaves the headset in A2DP for music.
+SOURCES = [t for t in os.environ.get("VD_SOURCE", "").replace(",", " ").split()
+           if t]
+# How long a look at the capture-source list stays good for. The mic is resolved
+# on the key press, and a subprocess there would clip the first word, so the list
+# is refreshed on the idle tick instead and read from cache when it matters. The
+# cost of the window is that a headset which dies right now may swallow one take
+# before the fallback takes over.
+SOURCE_POLL_SEC = float(os.environ.get("VD_SOURCE_POLL_SEC", "10"))
 # ffmpeg -af chain applied to the recording, tuned gentle so it helps whisper
 # rather than hurting it: kill sub-90 Hz rumble/handling noise, mild FFT
 # denoise, raise the level (the "louder & clearer" win), and a limiter so
@@ -366,13 +397,85 @@ def on_path(name):
 
 
 def find_recorder(rate="16000", channels="1"):
-    for cmd in (["pw-record", "--rate", rate, "--channels", channels, "--format", "s16"],
+    """The capture command for the first recorder on PATH, unpinned. The device
+    is chosen per take (see pick_source) and appended by pin_flag."""
+    for cmd in (["pw-record", "--rate", rate, "--channels", channels,
+                 "--format", "s16"],
                 ["parecord", f"--rate={rate}", f"--channels={channels}",
                  "--format=s16le", "--file-format=wav"],
                 ["arecord", "-f", "S16_LE", "-r", rate, "-c", channels, "-t", "wav"]):
         if on_path(cmd[0]):
             return cmd
     return None
+
+
+def pin_flag(cmd, source):
+    """How `cmd`'s recorder spells "capture from THIS device". Goes before the
+    output path, which the caller appends. Empty source = the system default."""
+    if not source:
+        return []
+    return {"pw-record": ["--target", source],
+            "parecord": [f"--device={source}"],
+            "arecord": ["-D", source]}.get(os.path.basename(cmd[0]), [])
+
+
+def list_sources():
+    """Names of the capture sources right now, or None when nothing on this box
+    can answer. None is not an empty set: "cannot tell" must not read as "your
+    mic is gone", which would unpin every take."""
+    for cmd, field in ((["pactl", "list", "short", "sources"], 1),
+                       (["pw-cli", "ls", "Node"], None)):
+        if not on_path(cmd[0]):
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode != 0:
+            continue
+        out = r.stdout.decode("utf-8", "replace")
+        if field is not None:
+            return {ln.split("\t")[field] for ln in out.splitlines()
+                    if len(ln.split("\t")) > field}
+        return set(re.findall(r'node\.name\s*=\s*"([^"]+)"', out))
+    return None
+
+
+_sources_seen = (0.0, None)
+
+
+def reset_source_cache():
+    global _sources_seen
+    _sources_seen = (0.0, None)
+
+
+def available_sources(now=None, max_age=None):
+    """The source list, re-probed at most every SOURCE_POLL_SEC. A failed probe
+    is never cached — the answer would be "cannot tell" for the whole window."""
+    global _sources_seen
+    now = time.time() if now is None else now
+    max_age = SOURCE_POLL_SEC if max_age is None else max_age
+    seen_at, names = _sources_seen
+    if names is None or now - seen_at >= max_age:
+        names = list_sources()
+        if names is not None:
+            _sources_seen = (now, names)
+    return names
+
+
+def pick_source(prefs, available):
+    """The first named mic that is actually there. Falling through the list is
+    the point: a headset that runs out of battery mid-session must cost one take
+    at worst, not the whole session. Nothing present -> the system default, on
+    the grounds that a lost take cannot be dictated again."""
+    if not prefs:
+        return ""
+    if available is None:
+        return prefs[0]
+    for name in prefs:
+        if name in available:
+            return name
+    return ""
 
 
 def condition_wav(src, dst):
@@ -625,6 +728,7 @@ class Dictation:
         self.clean = CLEAN_WAV
         self.mode = "verbatim"          # or "polish"; set per press in start()
         self.lang = LANG                # language for this take, from its key
+        self.source = None              # mic in use; None = nothing recorded yet
 
     @property
     def active(self):
@@ -651,7 +755,18 @@ class Dictation:
             except OSError:
                 pass
         self.t0 = time.time()
-        self.proc = subprocess.Popen(self.recorder + [self.wav],
+        # Resolve the mic per take rather than once at startup: headsets come and
+        # go mid-session, and the answer is read from a cache refreshed on the
+        # idle tick, so nothing here waits on a subprocess.
+        source = pick_source(SOURCES, available_sources())
+        if source != self.source:
+            log("mic: recording from "
+                + (source or "the system default source")
+                + (f" (fallback; {SOURCES[0]} is not here)"
+                   if SOURCES and source != SOURCES[0] else ""))
+            self.source = source
+        self.proc = subprocess.Popen(self.recorder + pin_flag(self.recorder, source)
+                                     + [self.wav],
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         beep(POLISH_START_WAV if mode == "polish" and os.path.exists(POLISH_START_WAV)
@@ -871,10 +986,19 @@ def main():
     # With conditioning on, capture the richer 48 kHz/stereo altset and let
     # ffmpeg resample; otherwise record straight to whisper's 16 kHz/mono.
     clean_on = CLEAN and on_path("ffmpeg")
-    recorder = (find_recorder(REC_RATE, REC_CH) if clean_on else find_recorder())
+    recorder = find_recorder(REC_RATE, REC_CH) if clean_on else find_recorder()
     if recorder is None:
         log("no recorder (pw-record/parecord/arecord) found")
         sys.exit(1)
+    if SOURCES:
+        here = available_sources()
+        log("mic: " + " -> ".join(
+            n + ("" if here is None or n in here else " (absent)") for n in SOURCES))
+        if here is not None and not any(n in here for n in SOURCES):
+            log("mic: none of them is a capture source right now; takes will go "
+                "to the system default until one shows up")
+    else:
+        log("mic: system default source (VD_SOURCE unset)")
     log("mic conditioning: "
         + (f"on ({REC_RATE} Hz/{REC_CH}ch -> ffmpeg -> 16k mono)" if clean_on
            else "off (raw 16k mono)"
@@ -1079,6 +1203,9 @@ def main():
         if not dictation.active and time.time() >= next_scan:
             next_scan = time.time() + RESCAN_SEC
             rescan()
+            # Same idea as rescan(), for mics: refresh here (throttled to
+            # SOURCE_POLL_SEC inside) so start() reads a warm cache.
+            available_sources()
         verb_held, lang2_held, polish_held = triggers_now()
         # Polish wins: it is either its own key, or both dictation keys at once.
         if polish_held:
