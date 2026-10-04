@@ -227,12 +227,24 @@ a few days; each take is archived as the conditioned 16 kHz copy whisper saw,
 next to a `.txt` of what it heard. Then:
 
 ```bash
-./compare-takes.py                                  # all of it, small/medium/turbo
-./compare-takes.py --models small,medium --limit 40 # the newest 40 takes
+./compare-takes.py                                   # int8 vs fp16 on the GPU
+./compare-takes.py --models small,medium --limit 40  # the newest 40, on the CPU
+./compare-takes.py --models ov:large-v3-int8,qwen:1.7b-int8
 ```
 
 It reads `VD_PROMPT` from the running unit and the language from each take's
-filename, so the replay matches what the daemon really does.
+filename, so the replay matches what the daemon really does — literally, in that
+it loads the daemon's own backend classes rather than its own copy of them. An
+`ov:` name is OpenVINO on the GPU and `qwen:` is Qwen3-ASR; anything else is
+faster-whisper on the CPU. Mixing the families in one run is fair on text but
+not on time, so stop the daemon first if you came for the seconds — otherwise it
+is competing with the replay for the same iGPU.
+
+One trap worth knowing before reading the output: the `*` marks a model whose
+replay differs from what was pasted live, and what was pasted live came out of
+whichever model the daemon was running. Comparing the incumbent against itself
+is tautological, so when the incumbent is in the run, the flag says nothing and
+the disagreements have to be read by hand.
 
 This is worth the trouble because intuition is wrong here often enough to matter.
 Replaying 66 real takes is what showed that `large-v3-turbo`, the largest model,
@@ -240,6 +252,16 @@ is **not** the accuracy answer: it wins on proper nouns and foreign words but
 loses on plain Russian, breaking takes that `small` got right. It also killed
 three plausible speed ideas that measured as noise, including batching long
 takes — a GPU optimisation with nothing to gain on a thread-saturated CPU.
+
+The same harness killed the obvious next idea, which is why it is written down
+here rather than quietly tried again later. **int8 → fp16 is not an upgrade.**
+Quantisation is a lossy step, so running large-v3 at full precision looks like
+free accuracy; replayed over 200 takes it is not. The two disagreed on 16, and
+reading those by hand, int8 was the better reading six times to fp16's four,
+with three ties — and fp16 produced the single worst failure in the set, quietly
+truncating a take and dropping its last two words. For that it costs twice the
+disk (2.9 GB against 1.5) and about 8% more time per take. The idea was sound
+and the measurement said no.
 
 > Both `VD_KEEP_DIR` and `VD_LOG_TEXT` are off by default and should stay off
 > outside such an experiment: one writes recordings of everything you say to
@@ -359,9 +381,11 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VD_PTT_MOD` | *(empty)* | optional modifier(s), comma-separated; empty = single-key hold |
 | `VD_PTT_KEY_2` | *(empty)* | second dictation key, bound to its own language; empty = off |
 | `VD_PTT_LANG_2` | `en` | language for that second key |
-| `VOICE_DICTATE_BACKEND` | `openvino` | `openvino` (Arc iGPU) or `faster-whisper` (CPU). Falls back to the CPU engine on its own if OpenVINO can't start |
+| `VOICE_DICTATE_BACKEND` | `openvino` | `openvino` (whisper on the Arc iGPU), `qwen3-asr` (Qwen3-ASR on the same iGPU) or `faster-whisper` (CPU). Either GPU engine falls back to the CPU one on its own if it can't start |
 | `VD_OV_MODEL` | `~/.local/share/voice-dictate/models/whisper-large-v3-int8-ov` | OpenVINO IR model directory |
 | `VD_OV_DEVICE` | `GPU` | OpenVINO device: `GPU`, `NPU` or `CPU` |
+| `VD_QWEN_MODEL` | `~/.local/share/voice-dictate/models/qwen3-asr-1.7b-int8-ov` | Qwen3-ASR IR directory |
+| `VD_QWEN_DEVICE` | `GPU` | device for Qwen3-ASR |
 | `VD_SILENCE_RMS` | `0.002` | skip takes quieter than this instead of letting whisper invent subtitle credits for them |
 | `VOICE_DICTATE_MODEL` | `mobiuslabsgmbh/faster-whisper-large-v3-turbo` | model for the **CPU fallback** |
 | `VOICE_DICTATE_LANG` | `ru` | language code, or `auto` to detect per press — see below |
@@ -393,6 +417,26 @@ Common anglicisms whisper already knows (`докер`, `лог`, `кэш`, `Reac
 (`book_ticker`, `BTCUSDT`, `msx`, `материализатор`) are what the bias is for.
 Note that the prompt only helps words that are *in* it, so every wasted token is
 a term you dropped.
+
+The ceiling is whisper's, not speech recognition's. It exists because the
+vocabulary rides inside the model's own 448-token context, behind a
+`<|startofprev|>` token, so the prompt and the transcript compete for the same
+room. `VOICE_DICTATE_BACKEND=qwen3-asr` is meant to run Qwen3-ASR instead — an
+LLM with an audio encoder in front of it, which takes the same vocabulary as an
+ordinary system prompt, against a 65536-position context rather than 223 tokens.
+
+> ⚠️ **That backend does not run yet, for reasons upstream of this repo.** As of
+> 2026-10-04, genai (2026.4.1 *and* the 2026.5 nightly) loads Qwen3-ASR from
+> `openvino_encoder_model.xml` + `openvino_decoder_model.xml` and requires a
+> **stateful** decoder; optimum-intel 2.2.0 writes those exact names but exports
+> them **stateless**, so the model loads and then dies on the first generate()
+> with a missing `beam_idx`. The fix — optimum-intel PR #1985, which splits the
+> export into audio encoder + text embeddings + language model — is still open,
+> and no genai build reads that layout. Nothing published produces a stateful
+> decoder in the layout genai expects. The backend, its tests and its branch of
+> `compare-takes.py` are written and waiting; when the two sides meet, re-export
+> and measure. Until then it raises on startup and the daemon falls back to the
+> CPU engine, which is what that fallback is for.
 
 #### Speaking two languages
 

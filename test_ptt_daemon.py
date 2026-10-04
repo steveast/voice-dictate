@@ -203,5 +203,73 @@ class SourcesFromEnv(unittest.TestCase):
         self.assertEqual(importlib.reload(vd).SOURCES, [])
 
 
+class BuildBackend(unittest.TestCase):
+    """Which engine a VOICE_DICTATE_BACKEND name selects, and what happens when
+    it will not start.
+
+    The fallback is the part worth pinning. Every GPU engine here depends on a
+    runtime, a device and a multi-gigabyte model directory, any of which can go
+    missing between reboots — and dictation is the user's input method, so the
+    daemon that cannot reach the iGPU has to come up on the CPU rather than not
+    come up. A second engine made that an easy thing to break by accident: the
+    old code named OpenVINO twice, so a new backend bolted on beside it could
+    silently inherit no fallback at all.
+    """
+
+    def build_with(self, name, **patches):
+        with mock.patch.object(vd, "BACKEND", name), \
+             mock.patch.object(vd, "notify", lambda *a, **k: None), \
+             mock.patch.multiple(vd, **patches):
+            return vd.build_backend()
+
+    def ok(self, label):
+        """A stand-in engine that loads, tagged so the choice is visible."""
+        return lambda: label
+
+    def test_openvino_by_name(self):
+        self.assertEqual(self.build_with("openvino", OpenVinoBackend=self.ok("ov")),
+                         "ov")
+
+    def test_qwen_by_name(self):
+        self.assertEqual(self.build_with("qwen3-asr", QwenAsrBackend=self.ok("qwen")),
+                         "qwen")
+
+    def test_qwen_short_alias(self):
+        self.assertEqual(self.build_with("qwen", QwenAsrBackend=self.ok("qwen")),
+                         "qwen")
+
+    def test_cpu_by_name(self):
+        self.assertEqual(
+            self.build_with("faster-whisper", FasterWhisperBackend=self.ok("cpu")),
+            "cpu")
+
+    def test_unknown_name_falls_back_rather_than_raising(self):
+        self.assertEqual(self.build_with("nonsense",
+                                         FasterWhisperBackend=self.ok("cpu")),
+                         "cpu")
+
+    def test_a_gpu_engine_that_will_not_start_degrades_to_the_cpu(self):
+        def boom():
+            raise RuntimeError("no device")
+        for name, attr in (("openvino", "OpenVinoBackend"),
+                           ("qwen3-asr", "QwenAsrBackend")):
+            with self.subTest(backend=name):
+                self.assertEqual(
+                    self.build_with(name, **{attr: boom,
+                                             "FasterWhisperBackend": self.ok("cpu")}),
+                    "cpu")
+
+    def test_a_missing_model_directory_degrades_too(self):
+        # The most likely real failure: the model was never downloaded, or the
+        # directory moved. FileNotFoundError is not an Exception subclass people
+        # always remember to catch, so prove this one is.
+        def missing():
+            raise FileNotFoundError("no Qwen3-ASR model at /nope")
+        self.assertEqual(
+            self.build_with("qwen3-asr", QwenAsrBackend=missing,
+                            FasterWhisperBackend=self.ok("cpu")),
+            "cpu")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

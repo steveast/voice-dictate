@@ -18,13 +18,20 @@ The keys are NOT grabbed, so they still pass through to apps. With a modifier
 configured, the main key alone (plain "x") is left completely untouched.
 
 Config via env:
-  VOICE_DICTATE_BACKEND  "openvino" (whisper on the Intel Arc iGPU) or
-                         "faster-whisper" (CPU). OpenVINO falls back to the CPU
-                         engine by itself if it cannot start (default: openvino)
+  VOICE_DICTATE_BACKEND  "openvino" (whisper on the Intel Arc iGPU),
+                         "qwen3-asr" (Qwen3-ASR on the same iGPU, for a
+                         vocabulary that no longer has to fit whisper's 223
+                         tokens) or "faster-whisper" (CPU). Either GPU engine
+                         falls back to the CPU one by itself if it cannot
+                         start                              (default: openvino)
   VD_OV_MODEL            OpenVINO IR model directory
                          (default: ~/.local/share/voice-dictate/models/
                           whisper-large-v3-int8-ov)
   VD_OV_DEVICE           OpenVINO device: GPU, NPU, CPU     (default: GPU)
+  VD_QWEN_MODEL          Qwen3-ASR OpenVINO IR directory
+                         (default: ~/.local/share/voice-dictate/models/
+                          qwen3-asr-1.7b-int8-ov)
+  VD_QWEN_DEVICE         device for Qwen3-ASR               (default: GPU)
   VD_SILENCE_RMS         skip takes quieter than this rather than let whisper
                          invent subtitle credits for them   (default: 0.002)
   VOICE_DICTATE_MODEL    faster-whisper model id/size/path, used by the CPU
@@ -173,6 +180,19 @@ BACKEND = os.environ.get("VOICE_DICTATE_BACKEND", "openvino").strip().lower()
 OV_MODEL = os.path.expanduser(os.environ.get(
     "VD_OV_MODEL", "~/.local/share/voice-dictate/models/whisper-large-v3-int8-ov"))
 OV_DEVICE = os.environ.get("VD_OV_DEVICE", "GPU").strip()
+# Qwen3-ASR, run through the same OpenVINO runtime but a different pipeline
+# class. It is here for one reason that has nothing to do with WER: whisper
+# takes its vocabulary as an initial_prompt capped at 223 tokens, and VD_PROMPT
+# already sits at 209 of them, so every new term has to evict an old one. Qwen3
+# takes the same vocabulary as a system prompt against a 32k context, which
+# ends that budgeting entirely. Not the default — see QwenAsrBackend.
+QWEN_MODEL = os.path.expanduser(os.environ.get(
+    "VD_QWEN_MODEL", "~/.local/share/voice-dictate/models/qwen3-asr-1.7b-int8-ov"))
+QWEN_DEVICE = os.environ.get("VD_QWEN_DEVICE", "GPU").strip()
+# Qwen3 names languages in words ("Russian"), where whisper uses codes. Anything
+# not listed goes through untranslated, so an unexpected code reaches the model
+# as-is rather than silently becoming the wrong language.
+QWEN_LANGS = {"ru": "Russian", "en": "English"}
 # Whisper invents text when handed something that is not speech, and it invents
 # the *same* few phrases — they come from subtitle files in its training data.
 # Two guards, because the observed cases split evenly between two causes:
@@ -593,15 +613,98 @@ class OpenVinoBackend:
         return tok.encode(" " + PROMPT).ids, 223, tok.decode
 
 
+class QwenAsrBackend:
+    """Qwen3-ASR on the iGPU, through OpenVINO GenAI's ASRPipeline — the generic
+    speech interface that arrived in 2026.4 alongside Whisper's own.
+
+    What this buys is room for the vocabulary, not a better score. Whisper is
+    steered by `initial_prompt`, which it stuffs into its own 448-token context
+    behind a `<|startofprev|>` token, leaving 223 for us; past that it keeps the
+    TAIL and drops the front silently, which is why the daemon has to warn about
+    it at all. Qwen3 is an LLM with an audio encoder bolted on, so the same
+    vocabulary goes in as `context` — an ordinary system prompt — and the
+    ceiling stops being something anyone has to budget against.
+
+    ⚠️ As of 2026-10-04 this cannot actually run, and the reason is upstream,
+    not here. The two halves of the toolchain are mid-migration and no released
+    combination meets in the middle:
+
+      - genai, both 2026.4.1 and the 2026.5 nightly, loads Qwen3-ASR from
+        `openvino_encoder_model.xml` + `openvino_decoder_model.xml` and wants a
+        STATEFUL decoder (it asks the graph for `beam_idx`).
+      - optimum-intel 2.2.0, the newest release, writes exactly those two names
+        for this architecture but exports them STATELESS, so loading succeeds
+        and the first generate() dies on the missing `beam_idx`.
+      - optimum-intel PR #1985 fixes the export by splitting it the way the
+        release notes describe — audio_encoder + text_embeddings + language
+        model, stateful — but it is still open, and no genai build reads that
+        layout yet.
+
+    So the missing piece is a stateful decoder in the layout genai currently
+    expects, and nothing published produces one. When PR #1985 lands and a
+    genai that reads its output ships, re-export and this backend should work
+    as written; until then it raises and the daemon falls back to the CPU.
+
+    It would not be the default even then. Whisper large-v3 has a replay archive
+    of real dictation from this microphone saying it is right; Qwen3 has a
+    published Fleurs number for Russian and nothing from this room, on these
+    words. `./compare-takes.py --models ov:large-v3-int8,qwen:1.7b-int8` is how
+    that gets settled, once it can run at all.
+    """
+
+    name = "qwen3-asr"
+
+    def __init__(self):
+        import openvino_genai
+        global get_speech_timestamps
+        from faster_whisper.vad import get_speech_timestamps
+        if not os.path.isdir(QWEN_MODEL):
+            raise FileNotFoundError(f"no Qwen3-ASR model at {QWEN_MODEL}")
+        log(f"loading {os.path.basename(QWEN_MODEL)} on {QWEN_DEVICE} ...")
+        t0 = time.time()
+        self.pipe = openvino_genai.ASRPipeline(QWEN_MODEL, QWEN_DEVICE)
+        log(f"  {QWEN_DEVICE} pipeline ready in {time.time() - t0:.1f}s")
+
+    def transcribe(self, audio, lang):
+        # Same VAD as the OpenVINO path, for the same reason: no pipeline here
+        # runs one of its own, and a generative model handed a key knock will
+        # write something plausible about it rather than return nothing.
+        if not get_speech_timestamps(audio):
+            log("no speech in take (VAD), skipped")
+            return "", lang
+        cfg = self.pipe.get_generation_config()
+        if lang:
+            cfg.language = QWEN_LANGS.get(lang, lang)
+        if PROMPT:
+            cfg.context = PROMPT
+        res = self.pipe.generate(audio.tolist(), cfg)
+        return str(res).strip(), lang
+
+    def prompt_budget(self):
+        """No whisper ceiling to warn about, so report the real one.
+
+        The number still has to be honest rather than infinite: the vocabulary
+        is a system prompt inside the thinker's 65536-position context, and a
+        VD_PROMPT anywhere near that is a mistake worth hearing about even
+        though the model would accept it.
+        """
+        tok = self.pipe.get_tokenizer()
+        ids = tok.encode(PROMPT).input_ids.data.ravel().tolist()
+        return ids, 65536, lambda i: tok.decode(i)
+
+
 def build_backend():
     """The configured engine, or the CPU one if it cannot be brought up. A
     missing GPU runtime must degrade to working dictation, never to no daemon."""
-    if BACKEND in ("openvino", "ov"):
+    gpu = {"openvino": OpenVinoBackend, "ov": OpenVinoBackend,
+           "qwen3-asr": QwenAsrBackend, "qwen": QwenAsrBackend}
+    if BACKEND in gpu:
         try:
-            return OpenVinoBackend()
+            return gpu[BACKEND]()
         except Exception as e:  # noqa: BLE001 — any failure means fall back
-            log("openvino unavailable, falling back to faster-whisper:", repr(e))
-            notify("⚠️ OpenVINO недоступен, работаю на CPU", 5000)
+            log(f"{BACKEND} unavailable, falling back to faster-whisper:",
+                repr(e))
+            notify(f"⚠️ {BACKEND} недоступен, работаю на CPU", 5000)
     elif BACKEND not in ("faster-whisper", "faster_whisper", "cpu"):
         log(f"unknown VOICE_DICTATE_BACKEND={BACKEND!r}, using faster-whisper")
     return FasterWhisperBackend()

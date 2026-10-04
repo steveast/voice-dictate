@@ -10,6 +10,12 @@ rejecting three plausible ideas that measured as noise.
     VD_KEEP_DIR=~/.local/share/voice-dictate/takes   # in the unit, then dictate
     ./compare-takes.py                               # a few days later
     ./compare-takes.py --models small,medium --limit 40
+    ./compare-takes.py --models ov:large-v3-int8,ov:large-v3-fp16 --limit 150
+
+An "ov:" name runs OpenVINO on the GPU, which is what the daemon itself uses;
+everything else is faster-whisper on the CPU. Comparing the two families in one
+run is fair on text but not on time — stop the daemon first if the seconds are
+what you came for, or it is competing with the replay for the same iGPU.
 
 There is no ground truth here, so the output is the DISAGREEMENTS: takes where
 the models produced different text. Where they agree the audio was clear and the
@@ -33,6 +39,7 @@ if os.path.exists(_VENV) and os.path.abspath(sys.prefix) != _VENV:
 
 import argparse
 import difflib
+import gc
 import re
 import statistics
 import subprocess
@@ -48,6 +55,51 @@ KNOWN = {"tiny": "Systran/faster-whisper-tiny",
          "medium": "Systran/faster-whisper-medium",
          "large-v3": "Systran/faster-whisper-large-v3",
          "turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo"}
+
+# The OpenVINO IR models, named after the directory install-openvino.sh drops
+# them in. These are the ones that matter now: the daemon has run on the GPU
+# since large-v3 turned out to cost about what medium did there, so a CPU-only
+# comparison answers a question nobody is asking any more.
+OV_DIR = os.path.expanduser("~/.local/share/voice-dictate/models")
+OV_KNOWN = {"medium-int8": "whisper-medium-int8-ov",
+            "large-v3-int8": "whisper-large-v3-int8-ov",
+            "large-v3-fp16": "whisper-large-v3-fp16-ov"}
+QWEN_KNOWN = {"1.7b-int8": "qwen3-asr-1.7b-int8-ov"}
+
+
+def _resolve(path):
+    """A known short name, an absolute path, or a directory under OV_DIR."""
+    path = os.path.expanduser(path)
+    return path if os.path.isabs(path) else os.path.join(OV_DIR, path)
+
+
+def build_runner(name, prompt):
+    """A loaded model that answers .transcribe(audio, lang) — by being one of
+    the daemon's own backends, not a reimplementation of it.
+
+    Reaching into vd's module globals is deliberate. The moment this file grows
+    its own copy of "how we transcribe" — its own VAD call, its own generation
+    config — it stops being evidence about the daemon and becomes evidence about
+    the replay, and the two drift apart silently, exactly when a measurement is
+    being trusted to settle an argument.
+
+    "ov:<name>" or "ov:<name>@DEVICE" is OpenVINO (GPU unless told otherwise),
+    "qwen:<name>" is Qwen3-ASR through the same runtime, and anything else is a
+    faster-whisper id or size on the CPU, as before.
+    """
+    vd.PROMPT = prompt
+    if name.startswith("qwen:"):
+        spec, _, device = name[5:].partition("@")
+        vd.QWEN_MODEL = _resolve(QWEN_KNOWN.get(spec, spec))
+        vd.QWEN_DEVICE = device or "GPU"
+        return vd.QwenAsrBackend()
+    if name.startswith("ov:"):
+        spec, _, device = name[3:].partition("@")
+        vd.OV_MODEL = _resolve(OV_KNOWN.get(spec, spec))
+        vd.OV_DEVICE = device or "GPU"
+        return vd.OpenVinoBackend()
+    vd.MODEL = KNOWN.get(name, name)
+    return vd.FasterWhisperBackend()
 
 
 def unit_prompt():
@@ -74,8 +126,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("takes", nargs="?",
                     default=os.path.expanduser("~/.local/share/voice-dictate/takes"))
-    ap.add_argument("--models", default="small,medium,turbo",
-                    help=f"comma-separated; known names {sorted(KNOWN)} or any HF id")
+    ap.add_argument("--models", default="ov:large-v3-int8,ov:large-v3-fp16",
+                    help=f"comma-separated; OpenVINO as ov:<name> "
+                         f"{sorted(OV_KNOWN)}, Qwen3-ASR as qwen:<name> "
+                         f"{sorted(QWEN_KNOWN)}, CPU as {sorted(KNOWN)} or any "
+                         f"HF id")
     ap.add_argument("--limit", type=int, default=0, help="only the newest N takes")
     ap.add_argument("--since", default="", help="only takes named on/after this (YYYYMMDD)")
     args = ap.parse_args()
@@ -93,24 +148,23 @@ def main():
     print(f"{len(wavs)} takes from {args.takes}")
     print(f"prompt: {len(prompt or '')} chars from the running unit\n")
 
-    from faster_whisper import WhisperModel
     out, secs = {}, {}
     for name in names:
-        model = WhisperModel(KNOWN.get(name, name), device="cpu",
-                             compute_type=vd.COMPUTE, cpu_threads=vd.THREADS)
+        runner = build_runner(name, prompt)
         texts, ts = {}, []
         for w in wavs:
             lang = w.rsplit("-", 1)[-1][:-4]          # ...-0042-ru.wav
             audio = vd.load_wav(os.path.join(args.takes, w))
             t = time.time()
-            segs, _ = model.transcribe(
-                audio, language=None if lang == "auto" else lang,
-                beam_size=vd.BEAM, vad_filter=True, initial_prompt=prompt)
-            texts[w] = "".join(s.text for s in segs).strip()
+            texts[w], _ = runner.transcribe(audio,
+                                            None if lang == "auto" else lang)
             ts.append(time.time() - t)
         out[name], secs[name] = texts, ts
-        print(f"{name:10} median {statistics.median(ts):5.2f}s/take", flush=True)
-        del model
+        print(f"{name:14} median {statistics.median(ts):5.2f}s/take", flush=True)
+        # A GPU pipeline holds its weights until the binding is collected, and
+        # two large-v3 on a shared-memory iGPU is how the last run died.
+        del runner
+        gc.collect()
 
     print("\n=== takes where the models disagree ===\n")
     differ = 0
@@ -127,7 +181,7 @@ def main():
             print(f"    pasted at the time: {live}")
         for n in names:
             flag = " " if live and norm(variants[n]) == norm(live) else "*"
-            print(f"  {flag} {n:10}: {variants[n]}")
+            print(f"  {flag} {n:14}: {variants[n]}")
         if len(names) >= 2:
             a, b = norm(variants[names[0]]).split(), norm(variants[names[-1]]).split()
             d = [x for x in difflib.ndiff(a, b) if x[0] in "+-"]
