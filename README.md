@@ -163,8 +163,16 @@ about what `medium` does (0.67 s vs 0.51 s), because both are dominated by
 whisper's fixed 30-second window rather than by model size. So the model-size
 trade-off that matters so much on CPU simply stops applying.
 
-Two things to know:
+Three things to know:
 
+- **An idle model gets paged out.** The iGPU has no memory of its own, so the
+  model sits in ordinary RAM (3.6 GB), and on a machine deep in swap the parts
+  nobody has touched for a while are the first to go. The take after a quiet
+  spell then waits on swap-in rather than on whisper: 3.1 s of audio once took
+  18.5 s. It never happened within 5 minutes of the previous take (0 of 106), so
+  after `VD_KEEPWARM_SEC` (120 s) without one the daemon runs a throwaway pass on
+  a second of silence, about 0.5 s of GPU. A pass that finds the model already
+  paged out is logged as `keep-warm took …s`.
 - **Non-speech takes.** faster-whisper runs Silero VAD internally; OpenVINO does
   not, and handed a dead capture or a key knock, whisper invents a subtitle
   credit ("Subtitles by the Amara.org community") which then gets pasted. The
@@ -384,6 +392,7 @@ Set these in `systemd/voice-ptt.service` (`Environment=…`) or the shell env:
 | `VOICE_DICTATE_BACKEND` | `openvino` | `openvino` (whisper on the Arc iGPU), `qwen3-asr` (Qwen3-ASR on the same iGPU) or `faster-whisper` (CPU). Either GPU engine falls back to the CPU one on its own if it can't start |
 | `VD_OV_MODEL` | `~/.local/share/voice-dictate/models/whisper-large-v3-int8-ov` | OpenVINO IR model directory |
 | `VD_OV_DEVICE` | `GPU` | OpenVINO device: `GPU`, `NPU` or `CPU` |
+| `VD_KEEPWARM_SEC` | `120` | after this long without a take, run a throwaway pass so the idle model is not paged out; `0` = off |
 | `VD_QWEN_MODEL` | `~/.local/share/voice-dictate/models/qwen3-asr-1.7b-int8-ov` | Qwen3-ASR IR directory |
 | `VD_QWEN_DEVICE` | `GPU` | device for Qwen3-ASR |
 | `VD_SILENCE_RMS` | `0.002` | skip takes quieter than this instead of letting whisper invent subtitle credits for them |

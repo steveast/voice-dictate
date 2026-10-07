@@ -271,5 +271,78 @@ class BuildBackend(unittest.TestCase):
             "cpu")
 
 
+class KeepWarm(unittest.TestCase):
+    """The idle worker re-touches the model so the take after a quiet spell
+    does not wait on swap-in (3.1s of audio once took 18.5s).
+
+    What is pinned: warming happens only while the queue is empty, a real take
+    always wins, and a failing warm-up can neither kill the worker nor keep
+    logging the same error every interval for the rest of the session."""
+
+    class Engine:
+        def __init__(self, on_warm=None, fail=False):
+            self.warmed = 0
+            self.on_warm = on_warm
+            self.fail = fail
+
+        def warm(self):
+            self.warmed += 1
+            if self.fail:
+                raise RuntimeError("GPU lost")
+            if self.on_warm:
+                self.on_warm()
+
+    def setUp(self):
+        patches = [mock.patch.object(vd, "KEEPWARM_SEC", 0.01),
+                   mock.patch.object(vd, "log", lambda *a, **k: None)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.jobs = vd.queue.Queue()
+
+    def test_a_queued_take_is_returned_without_warming(self):
+        engine = self.Engine()
+        self.jobs.put("take")
+        self.assertEqual(vd.next_take(self.jobs, engine), "take")
+        self.assertEqual(engine.warmed, 0)
+
+    def test_an_idle_queue_warms_until_a_take_arrives(self):
+        # The third pass "presses the key": the take queued then is handed over.
+        engine = self.Engine()
+        engine.on_warm = lambda: engine.warmed == 3 and self.jobs.put("take")
+        self.assertEqual(vd.next_take(self.jobs, engine), "take")
+        self.assertEqual(engine.warmed, 3)
+
+    def test_an_engine_without_warm_just_waits(self):
+        timer = vd.threading.Timer(0.05, self.jobs.put, ("take",))
+        timer.start()
+        self.assertEqual(vd.next_take(self.jobs, object()), "take")
+
+    def test_a_failing_warm_up_is_tried_once_then_dropped(self):
+        engine = self.Engine(fail=True)
+        timer = vd.threading.Timer(0.1, self.jobs.put, ("take",))
+        timer.start()
+        self.assertEqual(vd.next_take(self.jobs, engine), "take")
+        self.assertEqual(engine.warmed, 1)
+
+    def test_zero_turns_it_off(self):
+        engine = self.Engine()
+        timer = vd.threading.Timer(0.05, self.jobs.put, ("take",))
+        timer.start()
+        with mock.patch.object(vd, "KEEPWARM_SEC", 0):
+            self.assertEqual(vd.next_take(self.jobs, engine), "take")
+        self.assertEqual(engine.warmed, 0)
+
+    def test_a_slow_pass_is_logged(self):
+        logged = []
+        engine = self.Engine()
+        clock = iter([100.0, 100.0 + vd.WARM_SLOW_SEC + 1])
+        with mock.patch.object(vd, "log", lambda *a: logged.append(a)), \
+             mock.patch.object(vd.time, "time", lambda: next(clock)):
+            self.assertTrue(vd.keep_warm(engine))
+        self.assertEqual(len(logged), 1)
+        self.assertIn("paged out", logged[0][0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

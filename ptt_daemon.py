@@ -28,6 +28,9 @@ Config via env:
                          (default: ~/.local/share/voice-dictate/models/
                           whisper-large-v3-int8-ov)
   VD_OV_DEVICE           OpenVINO device: GPU, NPU, CPU     (default: GPU)
+  VD_KEEPWARM_SEC        after this long without a take, run one throwaway
+                         pass so the idle model is not paged out and the next
+                         take does not wait on swap; 0 = off (default: 120)
   VD_QWEN_MODEL          Qwen3-ASR OpenVINO IR directory
                          (default: ~/.local/share/voice-dictate/models/
                           qwen3-asr-1.7b-int8-ov)
@@ -180,6 +183,20 @@ BACKEND = os.environ.get("VOICE_DICTATE_BACKEND", "openvino").strip().lower()
 OV_MODEL = os.path.expanduser(os.environ.get(
     "VD_OV_MODEL", "~/.local/share/voice-dictate/models/whisper-large-v3-int8-ov"))
 OV_DEVICE = os.environ.get("VD_OV_DEVICE", "GPU").strip()
+# An idle model gets paged out, and the next take pays to bring it back. On an
+# iGPU there is no VRAM: the weights live in ordinary RAM as the driver's GEM
+# buffers (3.6 GB of shmem charged to this unit), and on a box that sits deep in
+# swap, buffers nobody has touched for a while are what goes first. The take
+# after a quiet spell then spends its time on swap-in, not on whisper — 3.1s of
+# audio took 18.5s. Over two days of the journal it was never the take that
+# followed a short pause: under 5 minutes idle, 0 of 106 took over 3s; after
+# 15-30 minutes, 2 of 8 did. So the worker runs one throwaway pass whenever it has
+# been idle this long, which keeps every take inside the range that was never
+# slow. Each pass is ~0.5s of GPU. 0 turns it off.
+KEEPWARM_SEC = float(os.environ.get("VD_KEEPWARM_SEC", "120"))
+# A keep-warm pass slower than this found the model already paged out, which is
+# the event worth a log line; the routine fast ones would only be noise.
+WARM_SLOW_SEC = 2.0
 # Qwen3-ASR, run through the same OpenVINO runtime but a different pipeline
 # class. It is here for one reason that has nothing to do with WER: whisper
 # takes its vocabulary as an initial_prompt capped at 223 tokens, and VD_PROMPT
@@ -583,8 +600,10 @@ class OpenVinoBackend:
         log(f"loading {os.path.basename(OV_MODEL)} on {OV_DEVICE} ...")
         t0 = time.time()
         self.pipe = openvino_genai.WhisperPipeline(OV_MODEL, OV_DEVICE)
-        # Kernels are compiled on first load; that cost is paid here, at startup,
-        # not on the first dictation.
+        # Kernels are compiled on first load, and the first inference costs
+        # another ~2s on top; both are paid here, at startup, not on the first
+        # dictation — and not mistaken for a paged-out model by keep_warm().
+        self.warm()
         log(f"  {OV_DEVICE} pipeline ready in {time.time() - t0:.1f}s")
 
     def transcribe(self, audio, lang):
@@ -605,6 +624,21 @@ class OpenVinoBackend:
         # path inside the binding.
         res = self.pipe.generate(audio.tolist(), cfg)
         return str(res).strip(), (getattr(res, "language", None) or lang)
+
+    def warm(self):
+        """Touch everything a take touches, so none of it sits idle long enough
+        to be paged out (see KEEPWARM_SEC). Whisper always encodes a full 30s
+        window, so a second of silence reaches every encoder weight, and one
+        decoder step reaches every decoder weight; capping the output at one
+        token keeps whisper from hallucinating its way through a long decode."""
+        silence = np.zeros(16000, dtype=np.float32)
+        get_speech_timestamps(silence)      # Silero is on the CPU, and swaps too
+        cfg = self.pipe.get_generation_config()
+        cfg.task = "transcribe"
+        cfg.max_new_tokens = 1
+        if LANG != "auto":
+            cfg.language = f"<|{LANG}|>"
+        self.pipe.generate(silence.tolist(), cfg)
 
     def prompt_budget(self):
         from tokenizers import Tokenizer
@@ -708,6 +742,37 @@ def build_backend():
     elif BACKEND not in ("faster-whisper", "faster_whisper", "cpu"):
         log(f"unknown VOICE_DICTATE_BACKEND={BACKEND!r}, using faster-whisper")
     return FasterWhisperBackend()
+
+
+def keep_warm(backend):
+    """One keep-warm pass, if the engine has one. Returns False once it has
+    failed, so the caller can stop asking rather than log the same error every
+    KEEPWARM_SEC for the rest of the session."""
+    warm = getattr(backend, "warm", None)
+    if warm is None:
+        return True
+    t0 = time.time()
+    try:
+        warm()
+    except Exception as e:  # noqa: BLE001 — warming must never take dictation down
+        log("keep-warm failed, turning it off:", repr(e))
+        return False
+    took = time.time() - t0
+    if took > WARM_SLOW_SEC:
+        log(f"keep-warm took {took:.1f}s: the model had been paged out")
+    return True
+
+
+def next_take(jobs, backend):
+    """Block until a take is queued, warming the model each time the queue has
+    stayed empty for KEEPWARM_SEC. Runs on the worker, the only thread that
+    touches the engine, so a pass can never overlap a real take."""
+    warming = KEEPWARM_SEC > 0
+    while True:
+        try:
+            return jobs.get(timeout=KEEPWARM_SEC if warming else None)
+        except queue.Empty:
+            warming = keep_warm(backend)
 
 
 def looks_like_junk(text):
@@ -1160,7 +1225,7 @@ def main():
 
     def worker():
         while True:
-            take = jobs.get()
+            take = next_take(jobs, backend)
             text, lang = dictation.transcribe(take)
             err = None
             if text and take.mode == "polish":
