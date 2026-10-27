@@ -433,6 +433,30 @@ def on_path(name):
                for p in os.environ.get("PATH", "").split(":"))
 
 
+def wayland_display(name, runtime_dir):
+    """The compositor socket wl-copy should talk to. The name is not a constant:
+    KWin takes the first free wayland-N, and on 2026-10-27 that was wayland-1,
+    while the unit pinned wayland-0 — every paste failed and ydotool's Ctrl+V
+    pasted whatever was already on the clipboard. The unit may also start before
+    Plasma exports the variable at all. So `name` is kept only if that socket
+    exists; otherwise the first live wayland-N socket wins, and "" when none."""
+    import glob
+    import stat
+
+    def is_socket(path):
+        try:
+            return stat.S_ISSOCK(os.stat(path).st_mode)
+        except OSError:
+            return False
+
+    if name and is_socket(os.path.join(runtime_dir, name)):
+        return name
+    for path in sorted(glob.glob(os.path.join(runtime_dir, "wayland-*"))):
+        if is_socket(path):
+            return os.path.basename(path)
+    return ""
+
+
 def find_recorder(rate="16000", channels="1"):
     """The capture command for the first recorder on PATH, unpinned. The device
     is chosen per take (see pick_source) and appended by pin_flag."""
@@ -1053,9 +1077,14 @@ class Dictation:
 
     def paste(self, text):
         env = dict(os.environ)
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
         env.setdefault("YDOTOOL_SOCKET",
-                       os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
-                                    ".ydotool_socket"))
+                       os.path.join(runtime_dir, ".ydotool_socket"))
+        display = wayland_display(env.get("WAYLAND_DISPLAY", ""), runtime_dir)
+        if display != env.get("WAYLAND_DISPLAY", ""):
+            log(f"wayland: {env.get('WAYLAND_DISPLAY') or '(unset)'} is not a "
+                f"socket, using {display or '(none found)'}")
+        env["WAYLAND_DISPLAY"] = display
 
         # Put the dictated text on the clipboard and leave it there. The auto
         # Ctrl+V below is best-effort — if focus has moved off the target field
@@ -1064,10 +1093,16 @@ class Dictation:
         # protocol, so a real clipboard-free Unicode type is not possible here.)
         # TRAILING is appended so back-to-back dictations don't glue together.
         try:
-            subprocess.run(["wl-copy"], input=(text + TRAILING).encode("utf-8"),
-                           check=False)
+            rc = subprocess.run(["wl-copy"], input=(text + TRAILING).encode("utf-8"),
+                                env=env, check=False).returncode
         except OSError:
             log("wl-copy missing")
+            return
+        if rc != 0:
+            # Ctrl+V now would paste the PREVIOUS clipboard into the field — worse
+            # than nothing, because it looks like a misrecognition.
+            log(f"wl-copy failed (rc={rc}), not pasting")
+            notify("❌ Не удалось положить текст в буфер", 3000)
             return
         time.sleep(0.05)
         try:

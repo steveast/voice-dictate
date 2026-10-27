@@ -5,8 +5,9 @@ Wants=ydotool.service
 
 [Service]
 Type=simple
-# Session plumbing (%t = XDG_RUNTIME_DIR, %h = home)
-Environment=WAYLAND_DISPLAY=wayland-0
+# Session plumbing (%t = XDG_RUNTIME_DIR, %h = home). No WAYLAND_DISPLAY here:
+# KWin's socket name changes between boots (wayland-0, wayland-1, ...), so the
+# daemon takes it from the session and checks it exists before every paste.
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
 # Dictation config (see README)

@@ -344,5 +344,50 @@ class KeepWarm(unittest.TestCase):
         self.assertIn("paged out", logged[0][0])
 
 
+class WaylandDisplay(unittest.TestCase):
+    """Which compositor socket the paste goes to. A wrong one fails silently from
+    the user's side: the take is recognised, and nothing lands in the field."""
+
+    def setUp(self):
+        import socket
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.socks = []
+
+        def listen(name):
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(os.path.join(self.dir, name))
+            self.socks.append(s)
+        self.listen = listen
+
+    def tearDown(self):
+        for s in self.socks:
+            s.close()
+        self.tmp.cleanup()
+
+    def test_named_socket_that_exists_is_kept(self):
+        self.listen("wayland-0")
+        self.listen("wayland-1")
+        self.assertEqual(vd.wayland_display("wayland-1", self.dir), "wayland-1")
+
+    def test_stale_name_falls_to_the_live_socket(self):
+        # The 2026-10-27 break: the unit said wayland-0, KWin was on wayland-1.
+        self.listen("wayland-1")
+        self.assertEqual(vd.wayland_display("wayland-0", self.dir), "wayland-1")
+
+    def test_unset_name_finds_the_socket(self):
+        self.listen("wayland-1")
+        self.assertEqual(vd.wayland_display("", self.dir), "wayland-1")
+
+    def test_lock_files_are_not_sockets(self):
+        open(os.path.join(self.dir, "wayland-0.lock"), "w").close()
+        self.listen("wayland-1")
+        self.assertEqual(vd.wayland_display("", self.dir), "wayland-1")
+
+    def test_nothing_there(self):
+        self.assertEqual(vd.wayland_display("wayland-0", self.dir), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
